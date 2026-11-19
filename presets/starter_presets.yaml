@@ -1,0 +1,54 @@
+# Clean starter presets for the Drama-3 -> MMH3 unified pipeline.
+# Override or add your own private presets locally without touching pipeline code.
+
+presets:
+  dialogue_closeup:
+    description: "Balanced close-up talking portrait locked to Drama-3 speech audio."
+    drama3:
+      response_format: "wav"
+      sample_rate: 44100
+      speed: 1.0
+    mmh3:
+      width: 768
+      height: 1280
+      fps: 24
+      steps: 24
+      precision: "nvfp4"
+      lock_audio: true
+      extra_args: []
+    prompt_prefix: "Cinematic medium close-up portrait, natural studio key light, subtle authentic facial expression."
+    prompt_suffix: "Smooth natural lip sync matching the reference dialogue, shallow depth of field."
+
+  cinematic_talking_head:
+    description: "16:9 widescreen dialogue shot driven by Drama-3 audio."
+    drama3:
+      response_format: "wav"
+      sample_rate: 44100
+      speed: 1.0
+    mmh3:
+      width: 1280
+      height: 768
+      fps: 24
+      steps: 28
+      precision: "nvfp4"
+      lock_audio: true
+      extra_args: []
+    prompt_prefix: "Film still aesthetic, 35mm lens, balanced rim lighting, clean background separation."
+    prompt_suffix: "Natural head micro-movements and expressive eye contact while speaking."
+
+  fast_preview:
+    description: "Fast lower-resolution layout & lip-sync verification pass."
+    drama3:
+      response_format: "wav"
+      sample_rate: 44100
+      speed: 1.0
+    mmh3:
+      width: 512
+      height: 768
+      fps: 24
+      steps: 12
+      precision: "nvfp4"
+      lock_audio: true
+      extra_args: []
+    prompt_prefix: "Clean medium shot, even lighting."
+    prompt_suffix: "Clear facial framing for audio-visual alignment check."

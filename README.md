@@ -1,0 +1,189 @@
+# SAA-Media-Avatar-Panel-Jordan
+
+[![GitHub Stars](https://img.shields.io/github/stars/CharAzinabulu0079/SAA-Media-Avatar-Panel-Jordan?style=flat-square&logo=github)](https://github.com/CharAzinabulu0079/SAA-Media-Avatar-Panel-Jordan/stargazers)
+[![Follow on X](https://img.shields.io/badge/X-@EricTong610488-000000?style=flat-square&logo=x)](https://x.com/EricTong610488)
+[![Hugging Face](https://img.shields.io/badge/Hugging_Face-Drama--3--Tier2--5Lang--INT3_(13.8_GiB)-FFD21E?style=flat-square&logo=huggingface&logoColor=000)](https://huggingface.co/ThinkingVibeCoder/Drama-3-Tier2-5Lang-INT3)
+[![Code License](https://img.shields.io/badge/Code-Apache--2.0_%2F_MIT-0969da?style=flat-square)](LICENSE)
+[![GPU: GB10 sm_121](https://img.shields.io/badge/GPU-DGX_Spark_GB10_(121.7_GiB)-76b900?style=flat-square)](#architecture)
+
+> ⭐ **Bookmark & Star This Recipe**: If this single-Spark **Drama-3 + MMH3** media stack, **13.80 GiB 5-language Drama-3 checkpoint**, or GB10 engine patch helps your local avatar/video workflow (whether reading directly or summarizing with an AI assistant), please **Star `CharAzinabulu0079/SAA-Media-Avatar-Panel-Jordan` on GitHub** and follow **[@EricTong610488 on X](https://x.com/EricTong610488)** for upcoming single-Spark GB10 optimizations and releases!
+
+A clean, modular, end-to-end **local Speech + Audio-Locked Video** starter stack pairing:
+
+1. **[Drama-3-Tier2-5Lang-INT3 (`13.80 GiB`)](https://huggingface.co/ThinkingVibeCoder/Drama-3-Tier2-5Lang-INT3)** — our 5-language (`ZH / EN / JA / KO / YUE`) pruned INT3 quantization of [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) running natively in Zig/CUDA via [drama-tensorfold](https://github.com/plotarmordev/drama-tensorfold) & [TensorFold](https://github.com/ashhart/TensorFold), enhanced with a **4-slot LRU VoiceCachePool patch**.
+2. **[mmh3](https://github.com/mmh3-org/mmh3)** — Yoshimasa Niwa's pure Rust/CUDA inference engine for [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) & [MiniMax H3 Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) (zero PyTorch / ComfyUI runtime), enhanced with our **GB10 Unified-Memory (`MemAvailable`), Async Sol-Attn, `nvfp4-slim`, CUDA Graph, and `--lock-audio` patch**.
+
+Designed from day one to **coexist cleanly on a single 121.7 GiB NVIDIA DGX Spark (GB10)** alongside our local LLM brain recipe ([`SAA-Brain-3.8-flash-next-Hibana`](https://github.com/CharAzinabulu0079/SAA-Brain-3.8-flash-next-Hibana)).
+
+> **Built with Fish Audio.** Model weights are hosted separately on Hugging Face under their respective upstream licenses (see [License & Tribute to Upstream Authors](#license--tribute-to-upstream-authors)).
+
+---
+
+## Architecture
+
+```text
+  Dialogue Script + Reference Voice + Portrait Image (<Picture 1>)
+                                │
+                                ▼
+             ┌──────────────────────────────────────┐
+             │   hooks/prompt_builder.py (Pluggable)│  <-- Swap in your own
+             │   presets/starter_presets.yaml       │      prompt compiler / style rules
+             └──────────────────┬───────────────────┘
+                                │
+             ┌──────────────────┴───────────────────┐
+             ▼                                      ▼
+  ┌─────────────────────────┐          ┌──────────────────────────────┐
+  │ Drama-3 TensorFold (Zig)│          │ mmh3 (Rust + CUDA / Metal)   │
+  │ 13.80 GiB 5-Lang INT3   │  WAV ──▶ │ GB10 MemAvailable + CUDA Gr. │
+  │ + 4-Slot LRU VoiceCache │          │ + Async Sol-Attn + nvfp4-slim│
+  │ (127.0.0.1:8013)        │          │ + --reference-audio          │
+  └─────────────────────────┘          │ + --lock-audio               │
+                                       └──────────────┬───────────────┘
+                                                      ▼
+                                       ┌──────────────────────────────┐
+                                       │ hooks/post_process.py        │ <-- Swap in your own
+                                       │ (FFmpeg clean mux + strip)   │     grading / QA loop
+                                       └──────────────────────────────┘
+```
+
+### Why This Repo Uses Clean Extension Hooks
+
+Rather than bundling personal voice assets, hard-coded production host topology, or opinionated multi-pass scene directors, this starter isolates the **reproducible systems layer** (13.80 GiB quantized weights + Zig/CUDA & Rust/CUDA patches + runnable audio-to-video pipeline) from the **creative/post-production layer** (`presets/`, `hooks/prompt_builder.py`, `hooks/post_process.py`). Drop in your own reference assets, prompt rules, and post-processing without touching core engine code.
+
+---
+
+## Measured Benchmarks (1× NVIDIA DGX Spark GB10, 121.7 GiB)
+
+### 1. Drama-3 Tier-2 5-Language INT3 (`ThinkingVibeCoder/Drama-3-Tier2-5Lang-INT3`)
+
+Evaluated across a 5-language dubbing test suite (`zh`, `en`, `ja`, `ko`, `yue`, plus code-switching) and 78 multilingual teacher-forcing prompts against the full `38.63 GiB` FP8 `fishaudio/drama-3` teacher:
+
+| Metric | Full FP8 (`fishaudio/drama-3`) | Baseline EN-Pruned INT3 (5,900 experts) | **Tier-2 5-Lang INT3 (This Release)** |
+|---|---:|---:|---:|
+| **Checkpoint Disk Size** | 38.63 GiB | 14.50 GiB | **13.80 GiB** |
+| **Loaded Weight Memory** | ~36.95 GiB | 14.46 GiB | **13.73 GiB** (`+0.304 GiB` workspace) |
+| **Retained MoE Experts** | 10,240 | 5,900 | **6,858** (across 40 layers) |
+| **Mean KL vs FP8 Teacher (78 prompts)** | 0.0000 | — | **0.0293** (`83.48%` top-1 agreement) |
+| **5-Language Pooled CER/WER** | — | 14.71% | **7.19%** (stock) / **8.82%** (VoiceCache) |
+| **Chinese (`zh`) CER** | — | 17.9% (`22/123`) | **0.8%–1.6%** (`1–2/123`) |
+| **English (`en`) WER** | — | 11.1% (`4/36`) | **5.6%–8.3%** (`2–3/36`) |
+| **Japanese (`ja`) / Korean (`ko`) Error** | — | 0.0% / 7.1% | **0.0% / 0.0%–3.6%** |
+| **Streaming TTFA (4-Slot LRU VoiceCache)** | — | 365.9 ms | **292.2 ms** (vs `552.6 ms` uncached, **-47%**) |
+
+### 2. MMH3 GB10 Engine Patch Highlights (`patches/mmh3/`)
+
+- **GB10 Unified-Memory (`MemAvailable`) Awareness**: Avoids misreading Linux page-cache-reclaimable memory as OOM on single unified-memory GB10 hosts, plus encodes vision embeddings prior to loading the full text encoder to cut peak overlap footprint.
+- **Performance Upgrades**: Async Sol-Attn dispatch, `nvfp4-slim` quantized weight support, CUDA Graph capture paths, `--save-context` reuse, and F16 LoRA linear support.
+- **Audio-Locked Video Generation (`--lock-audio`)**: Holds the encoded `--reference-audio` latent fixed during diffusion so Drama-3 speech directly drives MiniMax H3 video generation without drifting into synthetic re-voiced audio.
+
+---
+
+## Repository Layout
+
+| Path | License | Purpose |
+|---|---|---|
+| `patches/drama-tensorfold/0001-voice-cache-lru-pool.patch` | Apache-2.0 | Upgrades TensorFold Drama-3 single-slot `VoiceCache` to a **4-slot LRU `VoiceCachePool`** (`backbone.zig`, `tower.zig`, `drama_host.zig`). |
+| `patches/mmh3/0001-gb10-memavailable-perf-and-lock-audio.patch` | MIT | GB10 `MemAvailable` fix, vision/text peak-memory decoupling, async Sol-Attn, `nvfp4-slim`, CUDA Graph, F16 LoRA, and `--lock-audio` / continuation flags against `mmh3-org/mmh3` (`9c0652f`). |
+| `scripts/drama3_bridge_starter.py` | Apache-2.0 | Minimal loopback FastAPI speech bridge (`44.1 kHz -> 24 kHz` PCM streaming + 4-slot LRU `/warmup`). |
+| `scripts/media_panel_starter.py` | Apache-2.0 | End-to-end Drama-3 -> MMH3 (`--reference-audio --lock-audio`) unified starter CLI. |
+| `presets/starter_presets.yaml` | Apache-2.0 | Runnable starter presets (`dialogue_closeup`, `cinematic_talking_head`, `fast_preview`). |
+| `hooks/prompt_builder.py` & `hooks/post_process.py` | Apache-2.0 | Clean extension points for custom prompt compilers and post-processing. |
+| `deploy/drama3-tensorfold.service.example` & `.env.example` | Apache-2.0 | Loopback-only deployment templates. |
+
+---
+
+## Quickstart
+
+### 1. Download the 13.80 GiB 5-Language Drama-3 Checkpoint
+
+```bash
+hf download ThinkingVibeCoder/Drama-3-Tier2-5Lang-INT3 \
+  --local-dir ./models/drama-3-tier2-5lang-int3
+```
+
+### 2. Build Drama-3 on TensorFold + Apply the 4-Slot LRU VoiceCache Patch
+
+Follow [plotarmordev/drama-tensorfold](https://github.com/plotarmordev/drama-tensorfold) to clone and build the NVFP4/INT3 TensorFold engine, then apply our patch inside the TensorFold checkout:
+
+```bash
+cd /path/to/drama-tensorfold/build/tensorfold-opt
+git apply /path/to/SAA-Media-Avatar-Panel-Jordan/patches/drama-tensorfold/0001-voice-cache-lru-pool.patch
+# Rebuild TensorFold binary per drama-tensorfold instructions, then serve on loopback:
+./zig-out/bin/tensorfold serve \
+  --model /path/to/models/drama-3-tier2-5lang-int3 \
+  --host 127.0.0.1 --port 8013
+```
+
+*(Optional)* Start the 24 kHz streaming & LRU warmup bridge:
+
+```bash
+cp .env.example .env
+python3 scripts/drama3_bridge_starter.py
+```
+
+### 3. Build `mmh3` + Apply the GB10 & `--lock-audio` Patch
+
+```bash
+git clone https://github.com/mmh3-org/mmh3.git
+cd mmh3
+git checkout 9c0652f
+git apply /path/to/SAA-Media-Avatar-Panel-Jordan/patches/mmh3/0001-gb10-memavailable-perf-and-lock-audio.patch
+make
+make download-models
+```
+
+### 4. Run the Unified Drama-3 -> MMH3 Audio-Locked Pipeline
+
+```bash
+# Dry-run first to inspect resolved prompt & mmh3 command:
+python3 scripts/media_panel_starter.py \
+  --dialogue "Don't move. Listen closely—the signal is finally clean." \
+  --scene-prompt "A calm engineer looks into the lens under warm desk lamp light." \
+  --preset dialogue_closeup \
+  --ref-image ./portrait.png \
+  --dry-run
+
+# Live run (requires Drama-3 serving on 127.0.0.1:8013 and compiled mmh3 binary):
+python3 scripts/media_panel_starter.py \
+  --dialogue "Don't move. Listen closely—the signal is finally clean." \
+  --scene-prompt "A calm engineer looks into the lens under warm desk lamp light." \
+  --preset dialogue_closeup \
+  --ref-voice ./voices/sample.wav \
+  --ref-image ./portrait.png \
+  --remux-clean-audio \
+  --out ./outputs/demo.mp4
+```
+
+---
+
+## License & Tribute to Upstream Authors
+
+This repository aligns each component strictly with its upstream license (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)):
+
+- **Repository Glue, Scripts, Presets & Drama-3 TensorFold Patch (`patches/drama-tensorfold/`)**: **Apache License, Version 2.0** — aligned with `plotarmordev/drama-tensorfold` and `ashhart/TensorFold`.
+- **MMH3 Engine Patch (`patches/mmh3/`)**: **MIT License** — aligned with `mmh3-org/mmh3` (see [`patches/mmh3/LICENSE`](patches/mmh3/LICENSE)).
+- **Drama-3 Model Weights (`ThinkingVibeCoder/Drama-3-Tier2-5Lang-INT3`)**: **Fish Audio Community License, Version 1.0 (`FACL v1.0`)** — hosted on Hugging Face (`Built with Fish Audio`).
+- **MiniMax H3 / H3 Image Model Weights**: Downloaded separately from upstream under **MiniMax's respective Community License Agreements**.
+
+### Deep Gratitude to the Upstream Creators
+
+None of this single-Spark stack would exist without the extraordinary open-source engineering of:
+
+- **[Yoshimasa Niwa](https://github.com/mmh3-org/mmh3) (`mmh3-org/mmh3`)** — for building a pure Rust + CUDA/Metal inference engine for MiniMax H3 from scratch with Sol-Attn, NVFP4, VEDA, and distributed workers.
+- **[Fish Audio](https://huggingface.co/fishaudio/drama-3)** — for creating and releasing **Drama 3** (`Built with Fish Audio`).
+- **[plotarmordev](https://github.com/plotarmordev/drama-tensorfold)** ([`drama-3-NVFP4-Pruned-5900`](https://huggingface.co/plotarmordev/drama-3-NVFP4-Pruned-5900)) — for pioneering the pruned INT3/NVFP4 Drama-3 TensorFold recipe, CUDA INT3 expert kernel, head trimming, and BF16 codec tooling.
+- **[ashhart & TensorFold Contributors](https://github.com/ashhart/TensorFold)** — for the native Zig/CUDA/Metal TensorFold runtime.
+- **[MiniMax](https://huggingface.co/MiniMaxAI)**, **[Comfy-Org](https://github.com/Comfy-Org)** (`ComfyKitchen` / repackaged checkpoints), **[lightx2v](https://huggingface.co/lightx2v)**, and **[LBH-123-AI](https://huggingface.co/LBH-123-AI)** — for the MiniMax H3 ecosystem, kernels, Turbo LoRAs, and latent upscaler.
+
+---
+
+## Single-Spark GB10 Ecosystem & Follow Matrix
+
+If this stack helps you squeeze flagship LLM + multilingual TTS + video generation onto a single **NVIDIA DGX Spark (GB10)**:
+
+| Channel | Link | What You'll Find |
+|---|---|---|
+| ⭐ **Media / Avatar Repo (This Repo)** | [`CharAzinabulu0079/SAA-Media-Avatar-Panel-Jordan`](https://github.com/CharAzinabulu0079/SAA-Media-Avatar-Panel-Jordan) | Drama-3 + MMH3 GB10 patches, LRU VoiceCache, `--lock-audio` starter pipeline — **please Star!** |
+| 🧠 **LLM Brain Repo (GB10)** | [`CharAzinabulu0079/SAA-Brain-3.8-flash-next-Hibana`](https://github.com/CharAzinabulu0079/SAA-Brain-3.8-flash-next-Hibana) | Single-Spark Qwen3.8-Flash-Next lossless 4-step KL MTP distillation & 16-way serving recipe — **Star it too!** |
+| 🤗 **Hugging Face Models** | [`ThinkingVibeCoder`](https://huggingface.co/ThinkingVibeCoder) | Download [`Drama-3-Tier2-5Lang-INT3` (13.80 GiB)](https://huggingface.co/ThinkingVibeCoder/Drama-3-Tier2-5Lang-INT3) and future GB10 checkpoints. |
+| 🐦 **X / Twitter** | [`@EricTong610488`](https://x.com/EricTong610488) | Live single-Spark GB10 benchmarks, architecture notes, and release drops — **follow for updates!** |

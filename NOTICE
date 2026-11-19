@@ -1,0 +1,40 @@
+SAA-Media-Avatar-Panel-Jordan
+Copyright 2026 Contributors
+
+This repository contains single-Spark GB10 serving recipes, engine patches, and
+modular starter orchestration scripts built with gratitude for the following
+upstream projects. Each patch directory aligns with its upstream project's
+license:
+
+1. Engine Patches — Drama 3 on TensorFold (Apache License, Version 2.0)
+   Directory: patches/drama-tensorfold/
+   - TensorFold (https://github.com/ashhart/TensorFold)
+     Copyright 2026 TensorFold contributors — Apache License, Version 2.0.
+   - drama-tensorfold (https://github.com/plotarmordev/drama-tensorfold)
+     Copyright 2026 plotarmordev — Apache License, Version 2.0.
+   - plotarmordev/TensorFold (https://github.com/plotarmordev/TensorFold)
+     NVFP4 / INT3 Drama-3 CUDA fork — Apache License, Version 2.0.
+
+2. Engine Patches — mmh3 (MIT License)
+   Directory: patches/mmh3/
+   - mmh3 (https://github.com/mmh3-org/mmh3)
+     Copyright (c) 2026 Yoshimasa Niwa — MIT License.
+   - Upstream mmh3 also credits ComfyKitchen (Apache-2.0), Unicode Character
+     Database (Unicode License V3), NVIDIA nv-codec-headers (MIT), and
+     references MiniMax H3 / MiniMax H3 Image / Diffusers / Comfy-Org /
+     lightx2v / LBH-123-AI. See mmh3's upstream NOTICE for complete notices.
+
+3. Model Weights (Not Included in This Git Repository)
+   - Fish Audio Drama 3 & Community Quantized Checkpoint
+     (https://huggingface.co/fishaudio/drama-3 and
+     https://huggingface.co/ThinkingVibeCoder/Drama-3-Tier2-5Lang-INT3)
+     "Built with Fish Audio."
+     "These Fish Audio Materials are licensed under the Fish Audio Community
+     License, Version 1.0. Copyright © 39 AI, INC. All Rights Reserved."
+   - MiniMax H3 & MiniMax H3 Image
+     (https://huggingface.co/MiniMaxAI/MiniMax-H3 and
+     https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)
+     Subject to their respective MiniMax Community License Agreements.
+     Optional ecosystem weights (Comfy-Org repackaged weights, lightx2v Turbo
+     LoRAs, LBH-123-AI latent upscaler) remain subject to their respective
+     upstream licenses.

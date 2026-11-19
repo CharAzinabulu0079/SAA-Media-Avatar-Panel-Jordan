@@ -1,0 +1,335 @@
+diff --git a/zig/src/families/drama/backbone.zig b/zig/src/families/drama/backbone.zig
+index 450f24f14..13d978ae5 100644
+--- a/zig/src/families/drama/backbone.zig
++++ b/zig/src/families/drama/backbone.zig
+@@ -140,6 +140,64 @@ pub const Sequence = struct {
+     fn vCache(q: *const Sequence, slot: usize) u64 {
+         return q.kv_buf.ptr + (2 * slot + 1) * kvBytes(q.context);
+     }
++
++    pub fn savePrefix(q: *const Sequence, dst: *PrefixSnapshot, stream: cuda.Stream) !void {
++        if (q.pos > dst.cap) return error.DramaContextOverflow;
++        try dst.state_buf.copyFrom(0, q.state_buf.ptr, state_bytes, stream.handle);
++        const row_bytes = config.kv_heads * config.head_dim * 2;
++        const copy_bytes = q.pos * row_bytes;
++        if (copy_bytes > 0) {
++            const src_stride = kvBytes(q.context);
++            const dst_stride = kvBytes(dst.cap);
++            for (0..config.full_layers * 2) |b| {
++                try dst.kv_buf.copyFrom(b * dst_stride, q.kv_buf.ptr + b * src_stride, copy_bytes, stream.handle);
++            }
++        }
++        dst.gdn_states = q.gdn_states;
++        dst.pos = q.pos;
++    }
++
++    pub fn restorePrefix(q: *Sequence, src: *const PrefixSnapshot, stream: cuda.Stream) !void {
++        if (src.pos > q.context) return error.DramaContextOverflow;
++        try q.state_buf.copyFrom(0, src.state_buf.ptr, state_bytes, stream.handle);
++        const row_bytes = config.kv_heads * config.head_dim * 2;
++        const copy_bytes = src.pos * row_bytes;
++        if (copy_bytes > 0) {
++            const src_stride = kvBytes(src.cap);
++            const dst_stride = kvBytes(q.context);
++            for (0..config.full_layers * 2) |b| {
++                try q.kv_buf.copyFrom(b * dst_stride, src.kv_buf.ptr + b * src_stride, copy_bytes, stream.handle);
++            }
++        }
++        for (&q.gdn_states, 0..) |*st, slot| {
++            st.pending = src.gdn_states[slot].pending;
++            st.committed_bank = src.gdn_states[slot].committed_bank;
++        }
++        q.pos = src.pos;
++        q.poisoned = false;
++    }
++};
++
++pub const PrefixSnapshot = struct {
++    state_buf: cuda.DeviceBuffer,
++    kv_buf: cuda.DeviceBuffer,
++    gdn_states: [config.linear_layers]gdn.State = undefined,
++    pos: usize = 0,
++    cap: usize,
++
++    pub fn alloc(d: *const cuda.Driver, cap: usize) !PrefixSnapshot {
++        var state_buf = try cuda.DeviceBuffer.alloc(d, Sequence.state_bytes);
++        errdefer state_buf.free();
++        var kv_buf = try cuda.DeviceBuffer.alloc(d, config.full_layers * 2 * Sequence.kvBytes(cap));
++        errdefer kv_buf.free();
++        return .{ .state_buf = state_buf, .kv_buf = kv_buf, .cap = cap };
++    }
++
++    pub fn free(s: *PrefixSnapshot) void {
++        s.kv_buf.free();
++        s.state_buf.free();
++        s.* = undefined;
++    }
+ };
+ 
+ pub const Model = struct {
+diff --git a/zig/src/families/drama/tower.zig b/zig/src/families/drama/tower.zig
+index 595b0c1de..cbabd563b 100644
+--- a/zig/src/families/drama/tower.zig
++++ b/zig/src/families/drama/tower.zig
+@@ -637,6 +637,50 @@ pub const Model = struct {
+         return tower_fp8.census(&self.impl.layers);
+     }
+ 
++    pub const PrefixSnapshot = struct {
++        kv_buf: Buffer,
++        pos: usize = 0,
++        cap: usize,
++
++        pub fn alloc(d: *const cuda.Driver, cap: usize) !PrefixSnapshot {
++            const kv_buf = try Buffer.alloc(d, layer_count * 2 * cap * kv_width * 2);
++            return .{ .kv_buf = kv_buf, .cap = cap };
++        }
++
++        pub fn free(s: *PrefixSnapshot) void {
++            s.kv_buf.free();
++            s.* = undefined;
++        }
++    };
++
++    pub fn savePrefix(self: *const Model, dst: *PrefixSnapshot, stream: cuda.Stream) !void {
++        const p = self.impl;
++        if (p.position > dst.cap) return error.BadTowerRows;
++        const copy_bytes = p.position * kv_width * 2;
++        if (copy_bytes > 0) {
++            const src_stride = p.options.context * kv_width * 2;
++            const dst_stride = dst.cap * kv_width * 2;
++            for (0..layer_count * 2) |b| {
++                try dst.kv_buf.copyFrom(b * dst_stride, p.cache.ptr + b * src_stride, copy_bytes, stream.handle);
++            }
++        }
++        dst.pos = p.position;
++    }
++
++    pub fn restorePrefix(self: *Model, src: *const PrefixSnapshot, stream: cuda.Stream, prompt_tail: []const u32, seed: u64) !void {
++        try self.reset(stream, prompt_tail, seed);
++        const p = self.impl;
++        const copy_bytes = src.pos * kv_width * 2;
++        if (copy_bytes > 0) {
++            const src_stride = src.cap * kv_width * 2;
++            const dst_stride = p.options.context * kv_width * 2;
++            for (0..layer_count * 2) |b| {
++                try p.cache.copyFrom(b * dst_stride, src.kv_buf.ptr + b * src_stride, copy_bytes, stream.handle);
++            }
++        }
++        p.position = src.pos;
++    }
++
+     pub fn reset(self: *Model, stream: cuda.Stream, prompt_tail: []const u32, seed: u64) !void {
+         const p = self.impl;
+         try stream.synchronize();
+diff --git a/zig/src/native/drama_host.zig b/zig/src/native/drama_host.zig
+index d7d13d10e..e95609d38 100644
+--- a/zig/src/native/drama_host.zig
++++ b/zig/src/native/drama_host.zig
+@@ -77,6 +77,7 @@ const Host = struct {
+     // Worker-thread only: the prompt pass's frames and the generated codes, sized once at open.
+     frames: [chunk_rows + 1]Frame = undefined,
+     codes: []Codes = &.{},
++    voice_cache: ?VoiceCachePool = null,
+ 
+     // Under `mutex`: the one admitted request and what status reports of it.
+     mutex: std.Io.Mutex = .init,
+@@ -283,7 +284,7 @@ const Host = struct {
+         try h.check();
+         try h.ctx.makeCurrent(); // CUDA binds per thread: the worker's calls need the context current
+         const guided = if (r.unconditioned.len > 0) try h.guide.?.prefill(h, r) else null;
+-        const last = try prefill(&h.backbone, &h.tower, h.stream, &h.frames, r.prompt, r.codes, chunk_rows, r.seed, {}, h);
++        const last = try prefillCached(h, r.prompt, r.codes, r.seed);
+         const prefilled = h.now();
+         stats.prefill_seconds = @as(f64, @floatFromInt(prefilled - began)) / 1e9;
+         h.notePrefill(r.prompt.len + r.unconditioned.len, began, prefilled);
+@@ -383,6 +384,172 @@ const Host = struct {
+ /// A step's source: the last row's hidden state and semantic logits, borrowed until the next backbone run.
+ pub const Row = struct { hidden: cuda.DeviceBuffer, logits: cuda.DeviceBuffer };
+ 
++const voice_cache_cap: usize = 512;
++const voice_cache_slots: usize = 4;
++
++const VoiceCache = struct {
++    bb: drama.backbone.PrefixSnapshot,
++    tower: drama.tower.Model.PrefixSnapshot,
++    bridge_hidden: cuda.DeviceBuffer, // bf16 [hidden]
++    tokens: []u32,
++    codes: []Codes,
++    len: usize = 0,
++
++    fn init(gpa: Allocator, d: *const cuda.Driver) !VoiceCache {
++        var bb = try drama.backbone.PrefixSnapshot.alloc(d, voice_cache_cap);
++        errdefer bb.free();
++        var tower = try drama.tower.Model.PrefixSnapshot.alloc(d, voice_cache_cap);
++        errdefer tower.free();
++        var bridge = try cuda.DeviceBuffer.alloc(d, tower_hidden * 2);
++        errdefer bridge.free();
++        const tokens = try gpa.alloc(u32, voice_cache_cap);
++        errdefer gpa.free(tokens);
++        const codes = try gpa.alloc(Codes, voice_cache_cap);
++        return .{ .bb = bb, .tower = tower, .bridge_hidden = bridge, .tokens = tokens, .codes = codes };
++    }
++
++    fn deinit(vc: *VoiceCache, gpa: Allocator) void {
++        gpa.free(vc.codes);
++        gpa.free(vc.tokens);
++        vc.bridge_hidden.free();
++        vc.tower.free();
++        vc.bb.free();
++        vc.* = undefined;
++    }
++};
++
++const VoiceCachePool = struct {
++    slots: [voice_cache_slots]VoiceCache,
++    last_used: [voice_cache_slots]u64 = @splat(0),
++    tick: u64 = 0,
++
++    fn init(gpa: Allocator, d: *const cuda.Driver) !VoiceCachePool {
++        var slots: [voice_cache_slots]VoiceCache = undefined;
++        var inited: usize = 0;
++        errdefer for (0..inited) |i| slots[i].deinit(gpa);
++        for (0..voice_cache_slots) |i| {
++            slots[i] = try VoiceCache.init(gpa, d);
++            inited += 1;
++        }
++        return .{ .slots = slots };
++    }
++
++    fn deinit(pool: *VoiceCachePool, gpa: Allocator) void {
++        for (&pool.slots) |*slot| slot.deinit(gpa);
++        pool.* = undefined;
++    }
++
++    fn find(pool: *VoiceCachePool, prompt: []const u32, codes: []const Codes) ?*VoiceCache {
++        for (&pool.slots, 0..) |*slot, i| {
++            if (slot.len > 0 and prompt.len > slot.len and codes.len >= slot.len and
++                std.mem.eql(u32, slot.tokens[0..slot.len], prompt[0..slot.len]) and
++                std.mem.eql(Codes, slot.codes[0..slot.len], codes[0..slot.len]))
++            {
++                pool.tick += 1;
++                pool.last_used[i] = pool.tick;
++                return slot;
++            }
++        }
++        return null;
++    }
++
++    fn allocVictim(pool: *VoiceCachePool) *VoiceCache {
++        var best_i: usize = 0;
++        for (0..voice_cache_slots) |i| {
++            if (pool.slots[i].len == 0) {
++                best_i = i;
++                break;
++            }
++            if (pool.last_used[i] < pool.last_used[best_i]) best_i = i;
++        }
++        pool.tick += 1;
++        pool.last_used[best_i] = pool.tick;
++        return &pool.slots[best_i];
++    }
++};
++
++fn voicePrefixSplit(h: *const Host, prompt: []const u32, codes: []const Codes) usize {
++    if (codes.len == 0 or prompt.len <= 16) return 0;
++    var i: usize = prompt.len;
++    while (i > 0) {
++        i -= 1;
++        if (prompt[i] >= h.semantic_start and prompt[i] <= h.semantic_end) {
++            const split = i + 1;
++            if (split >= 32 and split < prompt.len and split <= voice_cache_cap) return split;
++            return 0;
++        }
++    }
++    return 0;
++}
++
++fn prefillCached(h: *Host, prompt: []const u32, codes: []const Codes, seed: u64) !Row {
++    const pool = &(h.voice_cache orelse return prefill(&h.backbone, &h.tower, h.stream, &h.frames, prompt, codes, chunk_rows, seed, {}, h));
++    const b = &h.backbone;
++    const t = &h.tower;
++    if (pool.find(prompt, codes)) |hit| {
++        try b.seq.restorePrefix(&hit.bb, h.stream);
++        try t.restorePrefix(&hit.tower, h.stream, prompt, seed);
++        h.frames[0] = promptFrame(prompt, codes, hit.len);
++        _ = try t.setInput(h.stream, h.frames[0..1]);
++        try t.prefill(h.stream, hit.bridge_hidden, h.frames[0..1]);
++        return prefillFrom(b, t, h.stream, &h.frames, prompt, codes, hit.len, chunk_rows, {}, h);
++    }
++
++    const split = voicePrefixSplit(h, prompt, codes);
++    if (split == 0) return prefill(&h.backbone, &h.tower, h.stream, &h.frames, prompt, codes, chunk_rows, seed, {}, h);
++    const vc = pool.allocVictim();
++
++    try b.reset(h.stream);
++    try t.reset(h.stream, prompt, seed);
++    var start: usize = 0;
++    var last: drama.backbone.Rows = undefined;
++    while (start < split) {
++        try h.check();
++        const end = @min(start + chunk_rows, split);
++        const n = end - start;
++        const look = @min(end + 1, split);
++        for (h.frames[0 .. look - start], start..) |*frame, idx| frame.* = promptFrame(prompt, codes, idx);
++        const extra = try t.setInput(h.stream, h.frames[0..n]);
++        last = try b.runTraced(h.stream, .prefill, prompt[start..end], extra, {});
++        if (last.rows != n) return error.DramaRowsMismatch;
++        const taught = look - start - 1;
++        if (taught > 0) try t.prefill(h.stream, last.hidden, h.frames[1 .. 1 + taught]);
++        start = end;
++    }
++    const last_hid = try lastRow(last.hidden, last.rows, b.hidden * 2);
++    try vc.bridge_hidden.copyFrom(0, last_hid.ptr, b.hidden * 2, h.stream.handle);
++    try b.seq.savePrefix(&vc.bb, h.stream);
++    try t.savePrefix(&vc.tower, h.stream);
++    @memcpy(vc.tokens[0..split], prompt[0..split]);
++    @memcpy(vc.codes[0..split], codes[0..split]);
++    vc.len = split;
++
++    h.frames[0] = promptFrame(prompt, codes, split);
++    _ = try t.setInput(h.stream, h.frames[0..1]);
++    try t.prefill(h.stream, vc.bridge_hidden, h.frames[0..1]);
++    return prefillFrom(b, t, h.stream, &h.frames, prompt, codes, split, chunk_rows, {}, h);
++}
++
++fn prefillFrom(b: *drama.backbone.Model, t: *drama.tower.Model, s: cuda.Stream, frames: *[chunk_rows + 1]Frame, prompt: []const u32, codes: []const Codes, from: usize, chunk: usize, trace: anytype, check: anytype) !Row {
++    var last: drama.backbone.Rows = undefined;
++    var start: usize = from;
++    while (start < prompt.len) {
++        if (@TypeOf(check) != void) try check.check();
++        const end = @min(start + chunk, prompt.len);
++        const n = end - start;
++        const look = @min(end + 1, prompt.len);
++        for (frames[0 .. look - start], start..) |*frame, i| frame.* = promptFrame(prompt, codes, i);
++        const extra = try t.setInput(s, frames[0..n]);
++        last = try b.runTraced(s, .prefill, prompt[start..end], extra, trace);
++        if (last.rows != n) return error.DramaRowsMismatch;
++        const taught = look - start - 1;
++        if (taught > 0) try t.prefill(s, last.hidden, frames[1 .. 1 + taught]);
++        if (end == prompt.len and taught > 0) _ = try t.setInput(s, frames[n - 1 .. n]);
++        start = end;
++    }
++    return .{ .hidden = try lastRow(last.hidden, last.rows, b.hidden * 2), .logits = try lastRow(last.semantic_logits, 1, logit_cols * 4) };
++}
++
+ /// Resets both models for a synthesis seeded `seed`, then the prompt pass in chunks of `chunk` (up to chunk_rows) rows,
+ /// each staged in the tower, run through the backbone (runTraced), all but the last row teacher-forced; check() each.
+ pub fn prefill(b: *drama.backbone.Model, t: *drama.tower.Model, s: cuda.Stream, frames: *[chunk_rows + 1]Frame, prompt: []const u32, codes: []const Codes, chunk: usize, seed: u64, trace: anytype, check: anytype) !Row {
+@@ -530,6 +697,8 @@ pub fn open(gpa: Allocator, io: std.Io, checkpoint_dir: []const u8, kernel_dir:
+     h.eos = h.backbone.eos;
+     if (options.cfg_every) |every| h.guide = try Guide.create(gpa, &h.backbone, every, options.cfg_batched);
+     errdefer if (h.guide) |g| g.destroy(gpa);
++    h.voice_cache = try VoiceCachePool.init(gpa, &h.driver);
++    errdefer if (h.voice_cache) |*vc| vc.deinit(gpa);
+ 
+     var name_buf: [256]u8 = undefined;
+     const name = h.ctx.name(&name_buf) catch "GPU";
+@@ -573,6 +742,7 @@ fn close(ctx: *anyopaque) void {
+     h.thread = null;
+     h.ctx.makeCurrent() catch {}; // the closing thread frees device memory
+     h.stream.synchronize() catch {};
++    if (h.voice_cache) |*vc| vc.deinit(h.gpa);
+     h.codec.deinit();
+     h.tower.deinit();
+     if (h.guide) |g| g.destroy(h.gpa);

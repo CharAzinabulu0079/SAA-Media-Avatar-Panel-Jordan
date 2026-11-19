@@ -1,0 +1,19 @@
+[Unit]
+Description=Drama-3 Tier-2 5-Language INT3 Speech Server (TensorFold)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/drama-tensorfold
+# Drop OS page cache before startup if coexisting with large unified-memory models
+# ExecStartPre=/usr/bin/python3 /path/to/drop_weight_cache.py /path/to/models/drama-3-tier2-5lang-int3
+ExecStart=/path/to/drama-tensorfold/build/tensorfold-opt/zig-out/bin/tensorfold serve \
+  --model /path/to/models/drama-3-tier2-5lang-int3 \
+  --host 127.0.0.1 \
+  --port 8013
+Restart=on-failure
+RestartSec=5
+MemoryHigh=20G
+
+[Install]
+WantedBy=default.target

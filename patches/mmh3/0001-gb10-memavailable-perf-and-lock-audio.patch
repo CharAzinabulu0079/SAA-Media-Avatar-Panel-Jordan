@@ -1,0 +1,1793 @@
+diff --git a/crates/mmh3-cuda/kernels/nvfp4.cu b/crates/mmh3-cuda/kernels/nvfp4.cu
+index d445ea6..78bcb46 100644
+--- a/crates/mmh3-cuda/kernels/nvfp4.cu
++++ b/crates/mmh3-cuda/kernels/nvfp4.cu
+@@ -306,3 +306,21 @@ extern "C" int mmh3_nvfp4_adapter_ranges(const int8_t *down, const float *down_s
+     maximum_bf16_kernel<<<256, THREADS, 0, stream>>>(up, up_count, maxima + 1);
+     return static_cast<int>(cudaGetLastError());
+ }
++
++__global__ void advance_scales_kernel(unsigned *const *ptrs, int count) {
++    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx < count) {
++        unsigned *pair = ptrs[idx];
++        pair[0] = pair[1];
++    }
++}
++
++extern "C" int mmh3_nvfp4_advance_scales(unsigned *const *ptrs, int count, cudaStream_t stream) {
++    if (count <= 0) {
++        return 0;
++    }
++    const int threads = 256;
++    const int blocks = (count + threads - 1) / threads;
++    advance_scales_kernel<<<blocks, threads, 0, stream>>>(ptrs, count);
++    return static_cast<int>(cudaGetLastError());
++}
+diff --git a/crates/mmh3-cuda/kernels/runtime.cu b/crates/mmh3-cuda/kernels/runtime.cu
+index 6387c71..da00420 100644
+--- a/crates/mmh3-cuda/kernels/runtime.cu
++++ b/crates/mmh3-cuda/kernels/runtime.cu
+@@ -202,6 +202,33 @@ extern "C" int mmh3_cuda_stream_synchronize(cudaStream_t stream) {
+     return static_cast<int>(cudaStreamSynchronize(stream));
+ }
+ 
++extern "C" int mmh3_cuda_stream_begin_capture(cudaStream_t stream) {
++    return static_cast<int>(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
++}
++
++extern "C" int mmh3_cuda_stream_end_capture(cudaStream_t stream, cudaGraphExec_t *exec_out) {
++    cudaGraph_t graph = nullptr;
++    cudaError_t status = cudaStreamEndCapture(stream, &graph);
++    if (status != cudaSuccess) {
++        if (graph != nullptr) {
++            cudaGraphDestroy(graph);
++        }
++        cudaGetLastError();
++        return static_cast<int>(status);
++    }
++    status = cudaGraphInstantiate(exec_out, graph, 0);
++    cudaGraphDestroy(graph);
++    return static_cast<int>(status);
++}
++
++extern "C" int mmh3_cuda_graph_launch(cudaGraphExec_t exec, cudaStream_t stream) {
++    return static_cast<int>(cudaGraphLaunch(exec, stream));
++}
++
++extern "C" int mmh3_cuda_graph_destroy(cudaGraphExec_t exec) {
++    return static_cast<int>(cudaGraphExecDestroy(exec));
++}
++
+ extern "C" int mmh3_cuda_event_create(cudaEvent_t *event) {
+     return static_cast<int>(cudaEventCreateWithFlags(event, cudaEventDisableTiming));
+ }
+@@ -260,3 +287,34 @@ extern "C" int mmh3_cuda_fill_f32(float *data, float value, size_t count) {
+     fill_f32_kernel<<<static_cast<unsigned>(block_count), threads_per_block>>>(data, value, count);
+     return static_cast<int>(cudaGetLastError());
+ }
++
++extern "C" int mmh3_cuda_zero(void *pointer, size_t bytes, cudaStream_t stream) {
++    return static_cast<int>(cudaMemsetAsync(pointer, 0, bytes, stream));
++}
++
++__global__ void accumulate_i32_to_u64_kernel(const int32_t *src, size_t count,
++                                             unsigned long long *dst) {
++    __shared__ unsigned long long shared[256];
++    unsigned long long sum = 0;
++    for (size_t i = threadIdx.x; i < count; i += blockDim.x) {
++        sum += static_cast<unsigned long long>(src[i]);
++    }
++    shared[threadIdx.x] = sum;
++    __syncthreads();
++    for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (threadIdx.x < stride) {
++            shared[threadIdx.x] += shared[threadIdx.x + stride];
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        *dst += shared[0];
++    }
++}
++
++extern "C" int mmh3_cuda_accumulate_i32_to_u64(const int32_t *src, size_t count,
++                                               uint64_t *dst, cudaStream_t stream) {
++    accumulate_i32_to_u64_kernel<<<1, 256, 0, stream>>>(
++        src, count, reinterpret_cast<unsigned long long *>(dst));
++    return static_cast<int>(cudaGetLastError());
++}
+diff --git a/crates/mmh3-cuda/src/attention.rs b/crates/mmh3-cuda/src/attention.rs
+index 1c6bf27..b64434b 100644
+--- a/crates/mmh3-cuda/src/attention.rs
++++ b/crates/mmh3-cuda/src/attention.rs
+@@ -156,6 +156,13 @@ struct RawSparseWorkspace {
+ }
+ 
+ unsafe extern "C" {
++    fn mmh3_cuda_zero(pointer: *mut c_void, bytes: usize, stream: *mut c_void) -> c_int;
++    fn mmh3_cuda_accumulate_i32_to_u64(
++        src: *const c_void,
++        count: usize,
++        dst: *mut c_void,
++        stream: *mut c_void,
++    ) -> c_int;
+     fn mmh3_attention_quantized(
+         query: *const c_void,
+         key: *const c_void,
+@@ -320,7 +327,7 @@ pub(crate) unsafe fn attention_pointers(
+             batch as c_int,
+             layout,
+             scale,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -365,7 +372,7 @@ pub(crate) unsafe fn attention_roped_pointers(
+             angles,
+             pairs as c_int,
+             epsilon,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -463,7 +470,7 @@ pub(crate) unsafe fn dense_bf16_pointers(
+             (3 * inner) as i64,
+             inner as i64,
+             scale,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -573,7 +580,7 @@ pub fn qk_norm_rope(
+             heads as c_int,
+             heads as c_int,
+             norm.epsilon,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -749,7 +756,7 @@ pub(crate) unsafe fn prepare_inputs_pointers(
+             tiles.1,
+             tiles.2,
+             value_head_maxima,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -810,7 +817,7 @@ pub(crate) unsafe fn dense_quantized_pointers(
+             ptr::null(),
+             &raw,
+             inputs.ready(),
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -832,6 +839,7 @@ pub struct SparseWorkspace {
+     tail_max: DeviceBuffer,
+     tail_sum: DeviceBuffer,
+     tail_values: DeviceBuffer,
++    routed_total: DeviceBuffer,
+ }
+ 
+ impl SparseWorkspace {
+@@ -866,6 +874,7 @@ impl SparseWorkspace {
+             tail_max: DeviceBuffer::new(heads * blocks * 4)?,
+             tail_sum: DeviceBuffer::new(heads * blocks * 4)?,
+             tail_values: DeviceBuffer::new(per_block)?,
++            routed_total: DeviceBuffer::zeroed(8)?,
+         })
+     }
+ 
+@@ -893,6 +902,34 @@ impl SparseWorkspace {
+         }
+     }
+ 
++    /// Resets the device-side routed counter before a multi-block pass.
++    pub fn reset_routed_total(&self) -> Result<(), CudaError> {
++        // SAFETY: routed_total holds 8 bytes on the device.
++        check(unsafe { mmh3_cuda_zero(self.routed_total.pointer(), 8, crate::active_stream()) })
++    }
++
++    /// Asynchronously accumulates this block's route_counts on the device without CPU sync.
++    pub fn accumulate_routed(&self) -> Result<(), CudaError> {
++        let count = self.route_counts.bytes() / 4;
++        // SAFETY: route_counts holds `count` i32s and routed_total holds one u64.
++        check(unsafe {
++            mmh3_cuda_accumulate_i32_to_u64(
++                self.route_counts.pointer(),
++                count,
++                self.routed_total.pointer(),
++                crate::active_stream(),
++            )
++        })
++    }
++
++    /// Reads the accumulated mean routed fraction once after `layers` blocks.
++    pub fn routed_fraction_total(&self, layers: usize) -> Result<f64, CudaError> {
++        let mut bytes = [0u8; 8];
++        self.routed_total.copy_to_host(&mut bytes)?;
++        let routed = u64::from_le_bytes(bytes);
++        Ok(routed as f64 / (layers * self.heads * self.blocks * self.blocks) as f64)
++    }
++
+     /// Fraction of (head, query block, key block) triples the last call routed token by token.
+     pub fn routed_fraction(&self) -> Result<f64, CudaError> {
+         let mut bytes = vec![0u8; self.route_counts.bytes()];
+@@ -953,7 +990,7 @@ pub(crate) unsafe fn sparse_pointers(
+             &raw,
+             quantized.as_ref().map_or(ptr::null(), |raw| raw),
+             inputs.ready(),
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -1185,7 +1222,7 @@ pub(crate) unsafe fn vsa_pointers(
+             &raw,
+             quantized.as_ref().map_or(ptr::null(), |raw| raw),
+             inputs.ready(),
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+diff --git a/crates/mmh3-cuda/src/dit.rs b/crates/mmh3-cuda/src/dit.rs
+index c68086a..16c2821 100644
+--- a/crates/mmh3-cuda/src/dit.rs
++++ b/crates/mmh3-cuda/src/dit.rs
+@@ -21,7 +21,7 @@ use crate::nvfp4::{
+ use crate::shard::{self, Region, ShardContext, VelocityRows};
+ use crate::streaming::{Pass, Stream};
+ use crate::veda::{VedaPass, VedaWeights};
+-use crate::{CudaError, DeviceBuffer, check, copy_device};
++use crate::{CudaError, CudaGraphExec, CudaStream, DeviceBuffer, StreamGuard, check, copy_device};
+ use mmh3_core::dit::config::DitConfig;
+ use mmh3_core::dit::inputs::DitInputs;
+ use mmh3_core::dit::latent::{pack_audio, patchify_video, unpack_audio, unpatchify_video};
+@@ -246,6 +246,20 @@ impl Workspace {
+ 
+ /// Buffers that one call leaves to the next. The steps of a generation share one sequence length,
+ /// so they allocate these gigabytes once, which saves about 0.3 s per step at 768p.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++struct GraphKey {
++    tokens: usize,
++    head: usize,
++    steps: usize,
++    sparse_tag: u8,
++    tau_bits: u32,
++    kept: usize,
++    key_blocks: (usize, usize),
++    query_blocks: (usize, usize),
++    attention_precision: u8,
++    nvfp4_count: usize,
++}
++
+ #[derive(Default)]
+ struct ForwardBuffers {
+     workspace: Option<Workspace>,
+@@ -253,6 +267,13 @@ struct ForwardBuffers {
+     vsa: Option<(AttentionPrecision, VsaPlan, VsaWorkspace)>,
+     veda: Option<VedaPass>,
+     text: Option<TextStates>,
++    stream: Option<CudaStream>,
++    angles: Option<DeviceBuffer>,
++    time_embedding: Option<DeviceBuffer>,
++    block_rows: Option<DeviceBuffer>,
++    modulations: Option<[DeviceBuffer; 2]>,
++    nvfp4_scale_ptrs: Option<DeviceBuffer>,
++    graphs: HashMap<GraphKey, (usize, Option<CudaGraphExec>)>,
+ }
+ 
+ /// Ends a stretch of a shared block, waiting for the device first, when the step is profiled.
+@@ -399,6 +420,8 @@ pub struct CudaDit {
+     /// NVFP4 versions of block linear layers by name, with their adapters, which run the video
+     /// rows in place of the INT8 weights.
+     nvfp4: HashMap<String, Nvfp4Weight>,
++    /// When true, INT8 weights of converted blocks were freed and all rows run in NVFP4.
++    nvfp4_drop_int8: bool,
+     /// Tensor scale histories of the NVFP4 layers' inputs, by layer. A VSA gate shares the input of
+     /// its block's qkv projection.
+     nvfp4_scales: HashMap<String, Nvfp4Scale>,
+@@ -538,6 +561,7 @@ impl CudaDit {
+             merged: false,
+             adapters: HashMap::new(),
+             nvfp4: HashMap::new(),
++            nvfp4_drop_int8: false,
+             nvfp4_scales: HashMap::new(),
+             adaln_table: host_tensor(file, &format!("{prefix}adaln_t_table"))?,
+             inverse_frequencies: host_tensor(file, &format!("{prefix}rope.inv_freq"))?.data,
+@@ -643,6 +667,7 @@ impl CudaDit {
+             merged: self.merged,
+             adapters,
+             nvfp4,
++            nvfp4_drop_int8: self.nvfp4_drop_int8,
+             nvfp4_scales,
+             adaln_table: self.adaln_table.clone(),
+             inverse_frequencies: self.inverse_frequencies.clone(),
+@@ -716,6 +741,7 @@ impl CudaDit {
+         if self.merged || !self.nvfp4.is_empty() {
+             return Ok(false);
+         }
++        self.buffers.borrow_mut().graphs.clear();
+         self.stream
+             .borrow_mut()
+             .make_room(&mut self.tensors.borrow_mut())
+@@ -952,6 +978,16 @@ impl CudaDit {
+     /// produce them. The adapters of these layers go into their NVFP4 weights too, so LoRAs come
+     /// first. The INT8 weights and adapters stay for the text and audio rows.
+     pub fn use_nvfp4(&mut self) -> Result<usize, Error> {
++        self.use_nvfp4_with(false)
++    }
++
++    /// Like `use_nvfp4`, but frees each block's INT8 weights and baked adapters immediately after
++    /// conversion and runs all tokens (including text and audio) in NVFP4.
++    pub fn use_nvfp4_slim(&mut self) -> Result<usize, Error> {
++        self.use_nvfp4_with(true)
++    }
++
++    fn use_nvfp4_with(&mut self, drop_int8: bool) -> Result<usize, Error> {
+         crate::nvfp4::check_supported()?;
+         if self.stream.get_mut().reads() {
+             return Err(Error::Model(
+@@ -1006,22 +1042,32 @@ impl CudaDit {
+                     }
+                     None => Columns::Inputs,
+                 };
+-                let weight = tensors.get(&format!("{name}.weight"))?;
+-                let scales = tensors.get(&format!("{name}.weight_scale"))?;
+-                let converted = Nvfp4Weight::from_int8_with(
+-                    &weight.buffer,
+-                    &scales.buffer,
+-                    weight.shape[0],
+-                    weight.shape[1],
+-                    part == "mlp.fc1",
+-                    columns,
+-                )?;
++                let converted = {
++                    let weight = tensors.get(&format!("{name}.weight"))?;
++                    let scales = tensors.get(&format!("{name}.weight_scale"))?;
++                    Nvfp4Weight::from_int8_with(
++                        &weight.buffer,
++                        &scales.buffer,
++                        weight.shape[0],
++                        weight.shape[1],
++                        part == "mlp.fc1",
++                        columns,
++                    )?
++                };
+                 self.nvfp4.insert(name.clone(), converted);
++                if drop_int8 {
++                    tensors.remove(&format!("{name}.weight"));
++                    tensors.remove(&format!("{name}.weight_scale"));
++                    self.adapters.remove(&name);
++                }
+                 if part != "attn.to_gate_compress" {
+                     self.nvfp4_scales.insert(name, Nvfp4Scale::new()?);
+                 }
+             }
+         }
++        if drop_int8 {
++            self.nvfp4_drop_int8 = true;
++        }
+         Ok(self.nvfp4.len())
+     }
+ 
+@@ -1092,7 +1138,7 @@ impl CudaDit {
+                 hidden as c_int,
+                 layer_weight.columns as c_int,
+                 self.config.norm_eps,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             )
+         })?;
+         Ok(())
+@@ -1191,7 +1237,7 @@ impl CudaDit {
+                 tokens as c_int,
+                 self.config.hidden as c_int,
+                 self.config.norm_eps,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             )
+         })?;
+         Ok(())
+@@ -1250,7 +1296,7 @@ impl CudaDit {
+                 tokens as c_int,
+                 hidden as c_int,
+                 self.config.norm_eps,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             )
+         })?;
+         Ok(())
+@@ -1281,7 +1327,7 @@ impl CudaDit {
+                 chunk as c_int,
+                 tokens as c_int,
+                 self.config.hidden as c_int,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             )
+         })?;
+         Ok(())
+@@ -1323,7 +1369,7 @@ impl CudaDit {
+                 steps as c_int,
+                 weight.shape[1] as c_int,
+                 weight.shape[0] as c_int,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             )
+         })?;
+         Ok(())
+@@ -1853,7 +1899,9 @@ impl CudaDit {
+                 && nvfp4_qkv.is_none()
+                 && self.tensors().is_int8(&qkv)
+         });
+-        if let Some(modulation) = modulation.filter(|_| self.tensors().is_int8(&qkv)) {
++        if let Some(modulation) =
++            modulation.filter(|_| self.tensors().is_int8(&qkv) || self.nvfp4.contains_key(&qkv))
++        {
+             let pending_gate = pending.map(|table| (table, MLP_GATE_CHUNK));
+             let int8_rows = if nvfp4_qkv.is_some() { head } else { tokens };
+             if int8_rows > 0 {
+@@ -1975,7 +2023,7 @@ impl CudaDit {
+                         config.heads as c_int,
+                         config.heads as c_int,
+                         config.norm_eps,
+-                        ptr::null_mut(),
++                        crate::active_stream(),
+                     ))?,
+                 }
+                 let scale = 1.0 / (config.head_dim as f32).sqrt();
+@@ -2074,7 +2122,9 @@ impl CudaDit {
+         let fc1 = format!("{prefix}.mlp.fc1");
+         let fc2 = format!("{prefix}.mlp.fc2");
+         let nvfp4_fc1 = self.nvfp4.get(&fc1).filter(|_| modulation.is_some());
+-        if let Some(modulation) = modulation.filter(|_| self.tensors().is_int8(&fc1)) {
++        if let Some(modulation) =
++            modulation.filter(|_| self.tensors().is_int8(&fc1) || self.nvfp4.contains_key(&fc1))
++        {
+             let int8_rows = if nvfp4_fc1.is_some() { head } else { tokens };
+             if int8_rows > 0 {
+                 self.add_norm_quantize(
+@@ -2127,7 +2177,7 @@ impl CudaDit {
+                     workspace.activated.pointer(),
+                     tokens as c_int,
+                     config.ffn as c_int,
+-                    ptr::null_mut(),
++                    crate::active_stream(),
+                 )
+             })?;
+         }
+@@ -2182,7 +2232,7 @@ impl CudaDit {
+                     workspace.activated.pointer_at(head * ffn * 2),
+                     tail as c_int,
+                     ffn as c_int,
+-                    ptr::null_mut(),
++                    crate::active_stream(),
+                 ))?;
+                 return self.linear(
+                     &fc2,
+@@ -2548,6 +2598,13 @@ impl CudaDit {
+             vsa: cached_vsa,
+             veda: cached_veda,
+             text: cached_text,
++            stream: cached_stream,
++            angles: cached_angles,
++            time_embedding: cached_time_embedding,
++            block_rows: cached_block_rows,
++            modulations: cached_modulations,
++            nvfp4_scale_ptrs: cached_nvfp4_ptrs,
++            graphs: cached_graphs,
+         } = &mut *buffers;
+         let shape = WorkspaceShape {
+             tokens: rows.len(),
+@@ -2668,6 +2725,7 @@ impl CudaDit {
+             rows.start == 0 && !matches!(cached_text, Some(text) if text.context == inputs.context);
+         let refiner = config.refiner_layers;
+         let mut stream = self.stream.borrow_mut();
++        let stream_reads = stream.reads();
+         let mut pass = stream.pass(
+             (0..refiner)
+                 .filter(|_| refine)
+@@ -2677,7 +2735,23 @@ impl CudaDit {
+         // Every table below is one entry per token, so a rank takes the slice its rows cover. The
+         // rope angles are the exception: attention sees the whole sequence once the inputs have
+         // been exchanged, so they stay whole.
+-        let block_rows = i32_buffer(&layout.modulation_rows(&timesteps)[rows.clone()])?;
++        let block_rows_host: Vec<i32> = layout.modulation_rows(&timesteps)[rows.clone()]
++            .iter()
++            .map(|&v| v as i32)
++            .collect();
++        let block_rows_bytes: &[u8] = unsafe {
++            std::slice::from_raw_parts(
++                block_rows_host.as_ptr().cast::<u8>(),
++                size_of_val(block_rows_host.as_slice()),
++            )
++        };
++        if cached_block_rows.as_ref().is_none_or(|b| b.bytes() != block_rows_bytes.len()) {
++            *cached_block_rows = None;
++            *cached_block_rows = Some(DeviceBuffer::new(block_rows_bytes.len())?);
++        }
++        cached_block_rows.as_mut().unwrap().copy_from_host(block_rows_bytes)?;
++        let block_rows = cached_block_rows.as_ref().unwrap();
++
+         let final_rows: Vec<usize> = layout
+             .segments
+             .iter()
+@@ -2688,16 +2762,40 @@ impl CudaDit {
+         let final_rows = i32_buffer(&final_rows[rows.clone()])?;
+         let audio = layout.segment(SegmentKind::Audio);
+         let video = layout.segment(SegmentKind::Video);
+-        let mut angles = layout.rope_angles(&self.inverse_frequencies);
++        let mut angles_host = layout.rope_angles(&self.inverse_frequencies);
+         let mut video_rows = patchify_video(&inputs.video);
+         if let Some(plan) = &plan {
+             let width = 3 * self.inverse_frequencies.len();
+-            let reordered = plan.reorder_video(&angles[video.start * width..], width);
+-            angles[video.start * width..].copy_from_slice(&reordered);
++            let reordered = plan.reorder_video(&angles_host[video.start * width..], width);
++            angles_host[video.start * width..].copy_from_slice(&reordered);
+             video_rows = plan.reorder_video(&video_rows, config.video_patch_features());
+         }
+-        let angles = DeviceBuffer::from_f32(&angles)?;
+-        let time_embedding = DeviceBuffer::from_f32(&timesteps.time_embedding(&self.adaln_table))?;
++        let angles_bytes: &[u8] = unsafe {
++            std::slice::from_raw_parts(
++                angles_host.as_ptr().cast::<u8>(),
++                size_of_val(angles_host.as_slice()),
++            )
++        };
++        if cached_angles.as_ref().is_none_or(|b| b.bytes() != angles_bytes.len()) {
++            *cached_angles = None;
++            *cached_angles = Some(DeviceBuffer::new(angles_bytes.len())?);
++        }
++        cached_angles.as_mut().unwrap().copy_from_host(angles_bytes)?;
++        let angles = cached_angles.as_ref().unwrap();
++
++        let te_host = timesteps.time_embedding(&self.adaln_table);
++        let te_bytes: &[u8] = unsafe {
++            std::slice::from_raw_parts(
++                te_host.as_ptr().cast::<u8>(),
++                size_of_val(te_host.as_slice()),
++            )
++        };
++        if cached_time_embedding.as_ref().is_none_or(|b| b.bytes() != te_bytes.len()) {
++            *cached_time_embedding = None;
++            *cached_time_embedding = Some(DeviceBuffer::new(te_bytes.len())?);
++        }
++        cached_time_embedding.as_mut().unwrap().copy_from_host(te_bytes)?;
++        let time_embedding = cached_time_embedding.as_ref().unwrap();
+ 
+         // The text rows sit at the start of the sequence, so rank 0 refines them and no other rank
+         // holds any of them.
+@@ -2784,7 +2882,7 @@ impl CudaDit {
+         // the rows at 768p without conditions, through their INT8 weights. At 448×256 against the FP32 reference, this takes the velocity from
+         // 3.3e-1 to 2.0e-1 for video and from 2.6e-1 to 9.2e-2 for audio (INT8 6.7e-2 and
+         // 3.9e-2). The text rows alone give 2.4e-1 and 2.3e-1.
+-        let head = if self.nvfp4.is_empty() {
++        let head = if self.nvfp4.is_empty() || self.nvfp4_drop_int8 {
+             0
+         } else {
+             video.start
+@@ -2818,63 +2916,152 @@ impl CudaDit {
+             }
+             (None, None) => None,
+         };
+-        let mut routed = 0.0;
+-        // Each block leaves its gated MLP output to the next, so the tables of two blocks are alive
+-        // at a time.
+-        let modulations = [
+-            DeviceBuffer::new(steps * MODALITY_COUNT * BLOCK_CHUNKS * hidden * 4)?,
+-            DeviceBuffer::new(steps * MODALITY_COUNT * BLOCK_CHUNKS * hidden * 4)?,
+-        ];
+-        let mut pending = None;
++        let mod_bytes = steps * MODALITY_COUNT * BLOCK_CHUNKS * hidden * 4;
++        if cached_modulations.as_ref().is_none_or(|m| m[0].bytes() != mod_bytes) {
++            *cached_modulations = None;
++            *cached_modulations = Some([
++                DeviceBuffer::new(mod_bytes)?,
++                DeviceBuffer::new(mod_bytes)?,
++            ]);
++        }
++        let modulations = cached_modulations.as_ref().unwrap();
++
++        if !self.nvfp4_scales.is_empty() && cached_nvfp4_ptrs.is_none() {
++            let ptrs: Vec<u64> = self
++                .nvfp4_scales
++                .values()
++                .map(|s| s.pair_pointer() as u64)
++                .collect();
++            let ptr_bytes: &[u8] = unsafe {
++                std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), size_of_val(ptrs.as_slice()))
++            };
++            *cached_nvfp4_ptrs = Some(DeviceBuffer::from_bytes(ptr_bytes)?);
++        }
++        let nvfp4_calibrated =
++            self.nvfp4_scales.is_empty() || self.nvfp4_scales.values().all(Nvfp4Scale::is_calibrated);
++
++        let can_graph = context.is_none()
++            && capture.is_empty()
++            && !stream_reads
++            && nvfp4_calibrated
++            && !matches!(sparse_pass, Some(SparsePass::Veda { .. }));
++
+         let mut blocks = Vec::new();
+-        for layer in 0..config.layers {
+-            let prefix = format!("blocks.{layer}");
+-            let modulation = &modulations[layer % 2];
+-            pass.enter(refiner + layer)?;
+-            self.modulation(
+-                &format!("{prefix}.adaln_proj.linear"),
+-                &time_embedding,
+-                steps,
+-                modulation,
+-            )?;
+-            self.transformer_block(
+-                &prefix,
+-                workspace,
+-                rows.len(),
+-                head,
+-                Some(&angles),
+-                Some((modulation, &block_rows)),
+-                pending,
+-                sparse_pass
+-                    .map(|pass| match pass {
+-                        SparsePass::Veda { pass, weights, .. } => SparsePass::Veda {
+-                            pass,
+-                            weights,
+-                            layer,
+-                        },
+-                        other => other,
+-                    })
+-                    .as_ref(),
+-                context.as_deref_mut().map(|context| (context, tokens)),
+-            )?;
+-            pass.leave(refiner + layer)?;
+-            pending = Some(modulation);
++        let mut run_blocks = |pass: &mut crate::streaming::Pass<'_>,
++                          blocks: &mut Vec<(usize, Vec<f32>)>|
++         -> Result<(), Error> {
+             if let Some(SparsePass::Sol { workspace, .. }) = &sparse_pass {
+-                routed += workspace.routed_fraction()?;
++                workspace.reset_routed_total()?;
++            }
++            let mut pending = None;
++            for layer in 0..config.layers {
++                let prefix = format!("blocks.{layer}");
++                let modulation = &modulations[layer % 2];
++                pass.enter(refiner + layer)?;
++                self.modulation(
++                    &format!("{prefix}.adaln_proj.linear"),
++                    &time_embedding,
++                    steps,
++                    modulation,
++                )?;
++                self.transformer_block(
++                    &prefix,
++                    workspace,
++                    rows.len(),
++                    head,
++                    Some(&angles),
++                    Some((modulation, &block_rows)),
++                    pending,
++                    sparse_pass
++                        .map(|pass| match pass {
++                            SparsePass::Veda { pass, weights, .. } => SparsePass::Veda {
++                                pass,
++                                weights,
++                                layer,
++                            },
++                            other => other,
++                        })
++                        .as_ref(),
++                    context.as_deref_mut().map(|context| (context, tokens)),
++                )?;
++                pass.leave(refiner + layer)?;
++                pending = Some(modulation);
++                if let Some(SparsePass::Sol { workspace, .. }) = &sparse_pass {
++                    workspace.accumulate_routed()?;
++                }
++                if capture.contains(&layer) {
++                    self.add_pending(workspace, rows.len(), modulation, &block_rows)?;
++                    pending = None;
++                    let mut residual = workspace.residual.to_f32()?;
++                    if let Some(plan) = &plan {
++                        let restored = plan.restore_video(&residual[video.start * hidden..], hidden);
++                        residual[video.start * hidden..].copy_from_slice(&restored);
++                    }
++                    blocks.push((layer, residual));
++                }
+             }
+-            if capture.contains(&layer) {
++            if let Some(modulation) = pending {
+                 self.add_pending(workspace, rows.len(), modulation, &block_rows)?;
+-                pending = None;
+-                let mut residual = workspace.residual.to_f32()?;
+-                if let Some(plan) = &plan {
+-                    let restored = plan.restore_video(&residual[video.start * hidden..], hidden);
+-                    residual[video.start * hidden..].copy_from_slice(&restored);
++            }
++            if nvfp4_calibrated && let Some(ptrs) = cached_nvfp4_ptrs.as_ref() {
++                unsafe { nvfp4::advance_scales(ptrs, self.nvfp4_scales.len())? };
++            }
++            Ok(())
++        };
++
++        if can_graph {
++            if cached_stream.is_none() {
++                *cached_stream = Some(CudaStream::new()?);
++            }
++            let stream_exec = cached_stream.as_ref().unwrap();
++            let (sparse_tag, tau_bits, kept, key_blocks, query_blocks) = match &sparse_pass {
++                Some(SparsePass::Sol { tau, sinks, .. }) => {
++                    (1u8, tau.to_bits(), 0usize, sinks.key_blocks, sinks.query_blocks)
++                }
++                Some(SparsePass::Vsa { kept, .. }) => (2u8, 0u32, *kept, (0, 0), (0, 0)),
++                _ => (0u8, 0u32, 0usize, (0, 0), (0, 0)),
++            };
++            let gkey = GraphKey {
++                tokens: rows.len(),
++                head,
++                steps,
++                sparse_tag,
++                tau_bits,
++                kept,
++                key_blocks,
++                query_blocks,
++                attention_precision: self.attention_precision as u8,
++                nvfp4_count: self.nvfp4.len(),
++            };
++            let entry = cached_graphs.entry(gkey).or_insert((0, None));
++            crate::synchronize()?;
++            if entry.0 == 0 {
++                let _guard = StreamGuard::enter(stream_exec);
++                run_blocks(&mut pass, &mut blocks)?;
++                stream_exec.synchronize()?;
++            } else {
++                if entry.1.is_none() {
++                    stream_exec.begin_capture()?;
++                    let res = {
++                        let _guard = StreamGuard::enter(stream_exec);
++                        run_blocks(&mut pass, &mut blocks)
++                    };
++                    match res {
++                        Ok(()) => {
++                            entry.1 = Some(stream_exec.end_capture()?);
++                        }
++                        Err(e) => {
++                            let _ = stream_exec.end_capture();
++                            return Err(e);
++                        }
++                    }
+                 }
+-                blocks.push((layer, residual));
++                entry.1.as_ref().unwrap().launch(stream_exec)?;
++                stream_exec.synchronize()?;
+             }
+-        }
+-        if let Some(modulation) = pending {
+-            self.add_pending(workspace, rows.len(), modulation, &block_rows)?;
++            entry.0 += 1;
++        } else {
++            run_blocks(&mut pass, &mut blocks)?;
+         }
+ 
+         let final_modulation = DeviceBuffer::new(steps * FINAL_CHUNKS * hidden * 4)?;
+@@ -2960,7 +3147,9 @@ impl CudaDit {
+                 .collect(),
+             routed_fraction: match &sparse_pass {
+                 Some(SparsePass::Veda { pass, .. }) => pass.kept_fraction()?,
+-                Some(SparsePass::Sol { .. }) => Some(routed / config.layers as f64),
++                Some(SparsePass::Sol { workspace, .. }) => {
++                    Some(workspace.routed_fraction_total(config.layers)?)
++                }
+                 _ => None,
+             },
+             part: None,
+diff --git a/crates/mmh3-cuda/src/gemm.rs b/crates/mmh3-cuda/src/gemm.rs
+index 1e20cc0..ba92540 100644
+--- a/crates/mmh3-cuda/src/gemm.rs
++++ b/crates/mmh3-cuda/src/gemm.rs
+@@ -81,7 +81,7 @@ pub(crate) unsafe fn rotate_quantize_pointers(
+             scales,
+             rows as c_int,
+             columns as c_int,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -339,7 +339,7 @@ unsafe fn int8_tiling(
+             adapter.scale,
+             output.column_maxima,
+             output.maxima_first_column as c_int,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+diff --git a/crates/mmh3-cuda/src/lib.rs b/crates/mmh3-cuda/src/lib.rs
+index 80f2628..d2ff81b 100644
+--- a/crates/mmh3-cuda/src/lib.rs
++++ b/crates/mmh3-cuda/src/lib.rs
+@@ -20,6 +20,7 @@ pub mod veda;
+ pub mod video_encoder;
+ pub mod vision;
+ 
++use std::cell::Cell;
+ use std::ffi::{CStr, c_char, c_int, c_void};
+ use std::fmt;
+ use std::ptr;
+@@ -70,6 +71,10 @@ unsafe extern "C" {
+     fn mmh3_cuda_stream_create(stream: *mut *mut c_void) -> c_int;
+     fn mmh3_cuda_stream_destroy(stream: *mut c_void) -> c_int;
+     fn mmh3_cuda_stream_synchronize(stream: *mut c_void) -> c_int;
++    fn mmh3_cuda_stream_begin_capture(stream: *mut c_void) -> c_int;
++    fn mmh3_cuda_stream_end_capture(stream: *mut c_void, exec_out: *mut *mut c_void) -> c_int;
++    fn mmh3_cuda_graph_launch(exec: *mut c_void, stream: *mut c_void) -> c_int;
++    fn mmh3_cuda_graph_destroy(exec: *mut c_void) -> c_int;
+     fn mmh3_cuda_error_string(code: c_int) -> *const c_char;
+     fn mmh3_cuda_malloc(pointer: *mut *mut c_void, bytes: usize) -> c_int;
+     fn mmh3_cuda_free_on(device: c_int, pointer: *mut c_void) -> c_int;
+@@ -337,10 +342,38 @@ pub fn check_device() -> Result<(), CudaError> {
+ /// holds is missing from the free figure, and what this process holds is missing from it too.
+ /// The Metal backend answers a different question under the same name, since a Mac has no figure
+ /// like this one to give.
++#[cfg(target_os = "linux")]
++fn parse_meminfo_available_bytes(contents: &str) -> Option<usize> {
++    for line in contents.lines() {
++        if let Some(rest) = line.strip_prefix("MemAvailable:") {
++            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
++            return kb.checked_mul(1024);
++        }
++    }
++    None
++}
++
++#[cfg(target_os = "linux")]
++fn host_available_bytes() -> Option<usize> {
++    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
++    let available = parse_meminfo_available_bytes(&contents)?;
++    let reserve_mb: usize = std::env::var("MMH3_HOST_RESERVE_MB")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(2048);
++    Some(available.saturating_sub(reserve_mb.saturating_mul(1024 * 1024)))
++}
++
+ pub fn memory_info() -> Result<(usize, usize), CudaError> {
+     let (mut free_bytes, mut total_bytes) = (0, 0);
+     // SAFETY: both are valid out pointers.
+     check(unsafe { mmh3_cuda_memory_info(&mut free_bytes, &mut total_bytes) })?;
++    #[cfg(target_os = "linux")]
++    if reads_host_memory().unwrap_or(false)
++        && let Some(host_avail) = host_available_bytes()
++    {
++        free_bytes = free_bytes.max(host_avail).min(total_bytes);
++    }
+     Ok((free_bytes, total_bytes))
+ }
+ 
+@@ -658,3 +691,135 @@ impl Drop for DeviceBuffer {
+         }
+     }
+ }
++
++
++thread_local! {
++    static ACTIVE_STREAM: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
++}
++
++pub(crate) fn active_stream() -> *mut c_void {
++    ACTIVE_STREAM.with(|slot| slot.get())
++}
++
++pub(crate) struct StreamGuard {
++    previous: *mut c_void,
++}
++
++impl StreamGuard {
++    pub(crate) fn enter(stream: &CudaStream) -> Self {
++        let previous = ACTIVE_STREAM.with(|slot| {
++            let prev = slot.get();
++            slot.set(stream.pointer());
++            prev
++        });
++        Self { previous }
++    }
++}
++
++impl Drop for StreamGuard {
++    fn drop(&mut self) {
++        ACTIVE_STREAM.with(|slot| slot.set(self.previous));
++    }
++}
++
++pub(crate) struct CudaStream {
++    raw: *mut c_void,
++    device: usize,
++}
++
++unsafe impl Send for CudaStream {}
++unsafe impl Sync for CudaStream {}
++
++impl CudaStream {
++    pub(crate) fn new() -> Result<Self, CudaError> {
++        let device = current_device()?;
++        let mut raw = ptr::null_mut();
++        // SAFETY: raw is a valid out pointer.
++        check(unsafe { mmh3_cuda_stream_create(&mut raw) })?;
++        Ok(Self { raw, device })
++    }
++
++    pub(crate) fn pointer(&self) -> *mut c_void {
++        self.raw
++    }
++
++    pub(crate) fn synchronize(&self) -> Result<(), CudaError> {
++        // SAFETY: raw is a live stream on self.device.
++        check(unsafe { mmh3_cuda_stream_synchronize(self.raw) })
++    }
++
++    pub(crate) fn begin_capture(&self) -> Result<(), CudaError> {
++        // SAFETY: raw is a live non-default stream.
++        check(unsafe { mmh3_cuda_stream_begin_capture(self.raw) })
++    }
++
++    pub(crate) fn end_capture(&self) -> Result<CudaGraphExec, CudaError> {
++        let mut exec = ptr::null_mut();
++        // SAFETY: raw is currently capturing.
++        check(unsafe { mmh3_cuda_stream_end_capture(self.raw, &mut exec) })?;
++        Ok(CudaGraphExec {
++            raw: exec,
++            device: self.device,
++        })
++    }
++}
++
++impl Drop for CudaStream {
++    fn drop(&mut self) {
++        if !self.raw.is_null() {
++            // SAFETY: raw was created by mmh3_cuda_stream_create.
++            unsafe {
++                let here = current_device().ok();
++                let _ = set_device(self.device);
++                mmh3_cuda_stream_destroy(self.raw);
++                if let Some(d) = here {
++                    let _ = set_device(d);
++                }
++            }
++        }
++    }
++}
++
++pub(crate) struct CudaGraphExec {
++    raw: *mut c_void,
++    device: usize,
++}
++
++unsafe impl Send for CudaGraphExec {}
++unsafe impl Sync for CudaGraphExec {}
++
++impl CudaGraphExec {
++    pub(crate) fn launch(&self, stream: &CudaStream) -> Result<(), CudaError> {
++        // SAFETY: raw is an instantiated executable CUDA graph and stream is live.
++        check(unsafe { mmh3_cuda_graph_launch(self.raw, stream.pointer()) })
++    }
++}
++
++impl Drop for CudaGraphExec {
++    fn drop(&mut self) {
++        if !self.raw.is_null() {
++            // SAFETY: raw was created by cudaGraphInstantiate.
++            unsafe {
++                let here = current_device().ok();
++                let _ = set_device(self.device);
++                mmh3_cuda_graph_destroy(self.raw);
++                if let Some(d) = here {
++                    let _ = set_device(d);
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod meminfo_tests {
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn parses_proc_meminfo_available() {
++        let sample = "MemTotal:       127600000 kB\nMemFree:         2400000 kB\nMemAvailable:   35000000 kB\n";
++        assert_eq!(
++            super::parse_meminfo_available_bytes(sample),
++            Some(35_000_000 * 1024)
++        );
++    }
++}
+diff --git a/crates/mmh3-cuda/src/model.rs b/crates/mmh3-cuda/src/model.rs
+index 252041b..8c008a1 100644
+--- a/crates/mmh3-cuda/src/model.rs
++++ b/crates/mmh3-cuda/src/model.rs
+@@ -465,11 +465,11 @@ impl DeviceTensors {
+                 activation_scales,
+                 adapter,
+             )?,
+-            DType::BF16 | DType::F32 => {
+-                let kind = if weight.dtype == DType::BF16 {
+-                    LinearKind::Bf16
+-                } else {
+-                    LinearKind::F32
++            DType::BF16 | DType::F32 | DType::F16 => {
++                let kind = match weight.dtype {
++                    DType::BF16 => LinearKind::Bf16,
++                    DType::F32 => LinearKind::F32,
++                    _ => LinearKind::F16,
+                 };
+                 // SAFETY: the caller passes buffers of `rows × features` inputs and
+                 // `rows × outputs` outputs, and the adapter's scratch buffer holds `rows × rank`
+@@ -569,7 +569,7 @@ pub(crate) unsafe fn cublaslt_linear(
+             rows as i64,
+             outputs as i64,
+             features as i64,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -756,7 +756,7 @@ impl LowRank {
+                 self.rank as i64,
+                 self.scale,
+                 1.0,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             ))?;
+         }
+         Ok(())
+diff --git a/crates/mmh3-cuda/src/nvfp4.rs b/crates/mmh3-cuda/src/nvfp4.rs
+index 6eb51d9..22b9444 100644
+--- a/crates/mmh3-cuda/src/nvfp4.rs
++++ b/crates/mmh3-cuda/src/nvfp4.rs
+@@ -74,6 +74,11 @@ unsafe extern "C" {
+         maxima: *mut c_void,
+         stream: *mut c_void,
+     ) -> c_int;
++    fn mmh3_nvfp4_advance_scales(
++        ptrs: *const *mut u32,
++        count: c_int,
++        stream: *mut c_void,
++    ) -> c_int;
+     fn mmh3_cublaslt_nvfp4(
+         weights: *const c_void,
+         weight_scales: *const c_void,
+@@ -357,6 +362,10 @@ impl Nvfp4Scale {
+         self.calls.get() > 0
+     }
+ 
++    pub(crate) fn pair_pointer(&self) -> *mut u32 {
++        self.maxima.pointer().cast()
++    }
++
+     /// The slots of the next call. The first call is exact, and later calls alternate between the
+     /// two slots.
+     pub(crate) fn next_call(&self) -> ScaleSlots {
+@@ -381,9 +390,9 @@ impl Nvfp4Scale {
+             }
+         } else {
+             ScaleSlots {
+-                reference: slot(call - 1),
++                reference: slot(0),
+                 margin: DELAYED_MARGIN,
+-                observed: slot(call),
++                observed: slot(1),
+                 exact: false,
+             }
+         }
+@@ -469,7 +478,20 @@ pub unsafe fn quantize_pointers(
+             rows as c_int,
+             weight.features as c_int,
+             weight.columns as c_int,
+-            ptr::null_mut(),
++            crate::active_stream(),
++        )
++    })
++}
++
++pub(crate) unsafe fn advance_scales(ptrs: &DeviceBuffer, count: usize) -> Result<(), CudaError> {
++    if count == 0 {
++        return Ok(());
++    }
++    check(unsafe {
++        mmh3_nvfp4_advance_scales(
++            ptrs.pointer().cast(),
++            count as c_int,
++            crate::active_stream(),
+         )
+     })
+ }
+@@ -508,7 +530,7 @@ pub unsafe fn gemm_pointers(
+                 down.outputs as c_int,
+                 weight.features as c_int,
+                 weight.columns as c_int,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             ))?;
+         }
+     }
+@@ -519,7 +541,7 @@ pub unsafe fn gemm_pointers(
+             scratch.cast(),
+             weight.tensor_scale,
+             scratch.add(1).cast(),
+-            ptr::null_mut(),
++            crate::active_stream(),
+         ))?;
+         check(mmh3_cublaslt_nvfp4(
+             weight.values.pointer(),
+@@ -531,7 +553,7 @@ pub unsafe fn gemm_pointers(
+             rows as i64,
+             weight.outputs as i64,
+             weight.columns as i64,
+-            ptr::null_mut(),
++            crate::active_stream(),
+         ))
+     }
+ }
+diff --git a/crates/mmh3-cuda/src/vae.rs b/crates/mmh3-cuda/src/vae.rs
+index 0f327c9..7de33c8 100644
+--- a/crates/mmh3-cuda/src/vae.rs
++++ b/crates/mmh3-cuda/src/vae.rs
+@@ -12,7 +12,7 @@ use crate::model::{
+     CONVROT_GROUP, DeviceTensors, Error, LinearKind, check_quantization, cublaslt_linear,
+     host_tensor, i32_buffer,
+ };
+-use crate::{CudaError, DeviceBuffer, check};
++use crate::{CudaError, CudaGraphExec, CudaStream, DeviceBuffer, StreamGuard, check};
+ use mmh3_core::media::Yuv420;
+ use mmh3_core::numeric::{f16_to_f32, f32_to_f16};
+ use mmh3_core::safetensors::{DType, SafeTensors};
+@@ -282,7 +282,7 @@ struct Decode {
+     /// The room the tiles are decoded in, with their rotary angles, made by the first chunk this
+     /// machine decodes itself. A decode that only puts canvases from elsewhere together never
+     /// makes it, and how much it takes is not known before the first chunk asks.
+-    work: Option<(Workspace, DeviceBuffer)>,
++    work: Option<(Workspace, DeviceBuffer, CudaStream, usize, Option<CudaGraphExec>)>,
+     tokens: usize,
+     canvas: DeviceBuffer,
+     denormalized: Tensor,
+@@ -833,7 +833,7 @@ impl CudaVideoDecoder {
+                 tokens as c_int,
+                 self.config.dim as c_int,
+                 NORM_EPSILON,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             )
+         })?;
+         Ok(())
+@@ -873,7 +873,7 @@ impl CudaVideoDecoder {
+                 tokens as c_int,
+                 dim as c_int,
+                 NORM_EPSILON,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             )
+         })?;
+         Ok(())
+@@ -888,7 +888,7 @@ impl CudaVideoDecoder {
+                 self.weights()?.tensors.pointer(scale)?,
+                 tokens as c_int,
+                 self.config.dim as c_int,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             )
+         })?;
+         Ok(())
+@@ -928,7 +928,7 @@ impl CudaVideoDecoder {
+                 patches as c_int,
+                 config.registers as c_int,
+                 dim as c_int,
+-                ptr::null_mut(),
++                crate::active_stream(),
+             ))?;
+         }
+ 
+@@ -1003,7 +1003,7 @@ impl CudaVideoDecoder {
+                     tokens as c_int,
+                     config.heads as c_int,
+                     NORM_EPSILON,
+-                    ptr::null_mut(),
++                    crate::active_stream(),
+                 ))?;
+                 attention_roped_pointers(
+                     Element::F16,
+@@ -1068,7 +1068,7 @@ impl CudaVideoDecoder {
+                         workspace.activated.pointer(),
+                         tokens as c_int,
+                         config.ffn as c_int,
+-                        ptr::null_mut(),
++                        crate::active_stream(),
+                     )
+                 })?;
+             }
+@@ -1404,18 +1404,53 @@ impl CudaVideoDecoder {
+             decode.work = Some((
+                 Workspace::new(config, decode.tokens, self.quantized, self.dense_ffn)?,
+                 DeviceBuffer::from_f32(&angles)?,
++                CudaStream::new()?,
++                0,
++                None,
+             ));
+         }
+-        let (workspace, angles) = decode.work.as_mut().expect("just made");
++        let (workspace, angles, stream, visits, graph) = decode.work.as_mut().expect("just made");
+         workspace.latent_rows.copy_from_host(&rows)?;
++        crate::synchronize()?;
+         let (workspace, angles) = (&*workspace, &*angles);
+-        self.decode_tiles(
+-            workspace,
+-            decode.tiles,
+-            decode.tile_tokens,
+-            decode.patches,
+-            angles,
+-        )?;
++        if *visits == 0 {
++            let _guard = StreamGuard::enter(stream);
++            self.decode_tiles(
++                workspace,
++                decode.tiles,
++                decode.tile_tokens,
++                decode.patches,
++                angles,
++            )?;
++            stream.synchronize()?;
++        } else {
++            if graph.is_none() {
++                stream.begin_capture()?;
++                let capture_res = {
++                    let _guard = StreamGuard::enter(stream);
++                    self.decode_tiles(
++                        workspace,
++                        decode.tiles,
++                        decode.tile_tokens,
++                        decode.patches,
++                        angles,
++                    )
++                };
++                match capture_res {
++                    Ok(()) => {
++                        let captured = stream.end_capture()?;
++                        *graph = Some(captured);
++                    }
++                    Err(e) => {
++                        let _ = stream.end_capture();
++                        return Err(e);
++                    }
++                }
++            }
++            graph.as_ref().unwrap().launch(stream)?;
++            stream.synchronize()?;
++        }
++        *visits += 1;
+         let first_tile = if capture_first_tile {
+             Some(self.first_tile(workspace, decode.chunk_frames, &decode.grid)?)
+         } else {
+diff --git a/src/generate.rs b/src/generate.rs
+index 7e3b3e8..20353d9 100644
+--- a/src/generate.rs
++++ b/src/generate.rs
+@@ -47,7 +47,7 @@ pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Erro
+     {
+         mmh3_cuda::check_device()?;
+         // Before the models load, which takes seconds a run that cannot compute would waste.
+-        if options.get("linear-precision").copied() == Some("nvfp4") {
++        if matches!(options.get("linear-precision").copied(), Some("nvfp4" | "nvfp4-slim")) {
+             mmh3_cuda::nvfp4::check_supported()?;
+         }
+         crate::models::load_algorithm_cache();
+diff --git a/src/generation.rs b/src/generation.rs
+index 8661eb9..d0a6e0e 100644
+--- a/src/generation.rs
++++ b/src/generation.rs
+@@ -70,10 +70,14 @@ pub const OPTIONS: &[&str] = &[
+     "veda-reference-sparsity",
+     "vram-budget",
+     "devices",
++    "init-latent",
++    "freeze-frames",
++    "save-latent",
++    "save-context",
+ ];
+ 
+ /// The options that stand alone, taking nothing after them.
+-pub const FLAGS: &[&str] = &["local-worker", "consistent"];
++pub const FLAGS: &[&str] = &["local-worker", "consistent", "lock-audio"];
+ 
+ /// Whether this process keeps its models between the runs it leads, which a server does and a
+ /// command does not. A process that keeps them lends its cards through the worker in it even when
+@@ -214,6 +218,9 @@ pub struct Settings {
+     /// The first steps, run on a canvas of half the width and height before the predicted clean
+     /// latent is enlarged and noised again to the next sigma.
+     pub draft_steps: usize,
++    /// `--lock-audio`: the target audio latent is the encoded `--reference-audio`, held fixed, so
++    /// the video denoises against it instead of generating its own soundtrack.
++    pub lock_audio: bool,
+     pub steps: usize,
+     pub seed: u64,
+     pub shift_video: f32,
+@@ -523,6 +530,7 @@ impl Settings {
+             schedule,
+             sampler,
+             draft_steps: option_number(options, "draft-steps", 0)?,
++            lock_audio: options.contains_key("lock-audio"),
+             seed: option_number(options, "seed", 0)? as u64,
+             shift_video,
+             shift_audio,
+@@ -548,13 +556,12 @@ impl Settings {
+                 )
+                 .into());
+             }
+-            if !(settings.keyframes.is_empty()
+-                && settings.references.is_empty()
+-                && settings.sounds.is_empty()
+-                && settings.clips.is_empty())
+-            {
+-                return Err("--draft-steps cannot be combined with keyframes or references".into());
+-            }
++            // Allow --draft-steps together with keyframes/references so reference-conditioned
++            // generations can draft at half resolution before full-resolution refinement.
++            // (Lifts the upstream guard while preserving draft-step validation above.)
++        }
++        if settings.lock_audio && settings.sounds.is_empty() {
++            return Err("--lock-audio needs a --reference-audio to lock".into());
+         }
+         let checked = before_lending(&settings)?;
+         settings.workers = machines
+@@ -679,6 +686,36 @@ pub fn sample(
+                         #[cfg(any(feature = "cuda", feature = "metal"))]
+                         let file = SafeTensors::open(Path::new(&path))?;
+                         #[cfg(any(feature = "cuda", feature = "metal"))]
++                        let pre_embeddings = if prompt_references.is_empty()
++                            || (pictures.is_empty() && clip_blocks.is_empty())
++                        {
++                            Vec::new()
++                        } else {
++                            #[cfg(feature = "cuda")]
++                            use mmh3_cuda::vision::CudaVisionEncoder as VisionEncoder;
++                            #[cfg(feature = "metal")]
++                            use mmh3_metal::vision::MetalVisionEncoder as VisionEncoder;
++
++                            #[allow(unused_mut)]
++                            let mut vision = VisionEncoder::load(&file)?;
++                            #[cfg(feature = "metal")]
++                            vision.set_precision(
++                                crate::metal::default_linear_precision(),
++                                crate::metal::attention_precision(options)?,
++                            )?;
++                            let mut embeddings = pictures
++                                .iter()
++                                .map(|picture| vision.encode(picture))
++                                .collect::<Result<Vec<_>, _>>()?;
++                            for blocks in &clip_blocks {
++                                for pair in blocks.chunks(2) {
++                                    embeddings
++                                        .push(vision.encode_frames(&pair[0], &pair[1])?);
++                                }
++                            }
++                            embeddings
++                        };
++                        #[cfg(any(feature = "cuda", feature = "metal"))]
+                         #[allow(unused_mut)]
+                         let mut encoder = TextEncoder::load_fitting(&file)?;
+                         #[cfg(feature = "metal")]
+@@ -697,40 +734,10 @@ pub fn sample(
+                         } else {
+                             {
+                                 use mmh3_core::vision::vision_prompt;
+-                                #[cfg(feature = "cuda")]
+-                                use mmh3_cuda::vision::CudaVisionEncoder as VisionEncoder;
+-                                #[cfg(feature = "metal")]
+-                                use mmh3_metal::vision::MetalVisionEncoder as VisionEncoder;
+-
+-                                // One embedding per vision block: the pictures, then the pairs of every clip.
+-                                // The tower is gone before the prompt encodes, since a Mac that streams
+-                                // the text encoder keeps back what the free memory allows.
+-                                let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
+-                                    Vec::new()
+-                                } else {
+-                                    #[allow(unused_mut)]
+-                                    let mut vision = VisionEncoder::load(&file)?;
+-                                    #[cfg(feature = "metal")]
+-                                    vision.set_precision(
+-                                        crate::metal::default_linear_precision(),
+-                                        crate::metal::attention_precision(options)?,
+-                                    )?;
+-                                    let mut embeddings = pictures
+-                                        .iter()
+-                                        .map(|picture| vision.encode(picture))
+-                                        .collect::<Result<Vec<_>, _>>()?;
+-                                    for blocks in &clip_blocks {
+-                                        for pair in blocks.chunks(2) {
+-                                            embeddings
+-                                                .push(vision.encode_frames(&pair[0], &pair[1])?);
+-                                        }
+-                                    }
+-                                    embeddings
+-                                };
+                                 let prompt =
+                                     vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
+                                 context_modalities = prompt.modalities.clone();
+-                                encoder.encode_prompt(&prompt, &embeddings, &[])?.context
++                                encoder.encode_prompt(&prompt, &pre_embeddings, &[])?.context
+                             }
+                         };
+                         #[cfg(any(feature = "cuda", feature = "metal"))]
+@@ -756,6 +763,18 @@ pub fn sample(
+                     if context.shape.len() == 3 && context.shape[0] == 1 {
+                         context.shape.remove(0);
+                     }
++                    if let Some(info) = file.get("modalities") {
++                        let mods = Tensor::load(&file, info)?;
++                        context_modalities = mods
++                            .data
++                            .iter()
++                            .map(|&v| match v.round() as i32 {
++                                0 => mmh3_core::dit::timestep::Modality::Video,
++                                1 => mmh3_core::dit::timestep::Modality::Text,
++                                _ => mmh3_core::dit::timestep::Modality::Audio,
++                            })
++                            .collect();
++                    }
+                     context
+                 }
+                 _ => return Err("pass a prompt or --context, not both".into()),
+@@ -774,8 +793,36 @@ pub fn sample(
+     // encode in between, so that a DiT that does not fit keeps back what they leave free.
+     let (context, context_modalities) =
+         encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
+-    if options.contains_key("context") && !prompt_references.is_empty() {
+-        return Err("keyframes and references need a prompt, not --context".into());
++    if options.contains_key("context")
++        && !prompt_references.is_empty()
++        && context_modalities.is_empty()
++    {
++        return Err(
++            "keyframes and references need a prompt or a --save-context file with modalities"
++                .into(),
++        );
++    }
++    if let Some(path) = options.get("save-context") {
++        let mut metadata = Vec::new();
++        if let Some(p) = options.get("prompt") {
++            metadata.push(("prompt", *p));
++        }
++        let mod_data: Vec<f32> = context_modalities
++            .iter()
++            .map(|&m| match m {
++                mmh3_core::dit::timestep::Modality::Video => 0.0,
++                mmh3_core::dit::timestep::Modality::Text => 1.0,
++                mmh3_core::dit::timestep::Modality::Audio => 2.0,
++            })
++            .collect();
++        let mod_shape = [mod_data.len()];
++        let mut tensors: Vec<(&str, &[usize], &[f32])> =
++            vec![("context", &context.shape, &context.data)];
++        if !mod_data.is_empty() {
++            tensors.push(("modalities", &mod_shape, &mod_data));
++        }
++        mmh3_core::safetensors::write_f32(Path::new(path), &tensors, &metadata)?;
++        println!("wrote the context {:?} to {path}", context.shape);
+     }
+     #[cfg(any(feature = "cuda", feature = "metal"))]
+     let latents = encode_pictures(options, settings.seed, &pictures)?;
+@@ -789,6 +836,19 @@ pub fn sample(
+     let sound_latents = encode_sounds(options, &settings.sounds)?;
+     #[cfg(not(any(feature = "cuda", feature = "metal")))]
+     let sound_latents: Vec<Tensor> = Vec::new();
++    // --lock-audio keeps the first reference sound as the target audio latent. It is taken here
++    // because the reference list below consumes the vector.
++    #[cfg(any(feature = "cuda", feature = "metal"))]
++    let locked_audio = if settings.lock_audio {
++        let encoded = sound_latents
++            .first()
++            .ok_or("--lock-audio needs a --reference-audio to lock")?;
++        Some(lock_audio_latent(encoded, &settings.shape.audio_latent_shape())?)
++    } else {
++        None
++    };
++    #[cfg(not(any(feature = "cuda", feature = "metal")))]
++    let locked_audio: Option<Tensor> = None;
+     #[cfg(any(feature = "cuda", feature = "metal"))]
+     let soundtrack_latents = encode_sounds(
+         options,
+@@ -858,10 +918,66 @@ pub fn sample(
+         video_shape.clone(),
+         noise.samples(video_shape.iter().product()),
+     );
+-    let mut audio = Tensor::new(
+-        audio_shape.clone(),
+-        noise.samples(audio_shape.iter().product()),
+-    );
++    // --init-latent / --freeze-frames: copy the tail of a previous run's latent into the head of
++    // this one and hold it fixed, which is what the ComfyUI node's _masked_continuation does with
++    // a noise_mask. Blocks of one replacement are otherwise generated independently, so a later
++    // block re-stages the shot instead of continuing the previous one.
++    let mut frozen: Option<(Tensor, usize)> = None;
++    if let Some(path) = options.get("init-latent") {
++        let hold = option_number(options, "freeze-frames", 0)?;
++        if hold > 0 {
++            let file = SafeTensors::open(Path::new(path))?;
++            let info = file
++                .get("video")
++                .or_else(|| file.tensors().first())
++                .ok_or("the init latent holds no tensor")?;
++            let init = Tensor::load(&file, info)?;
++            let [channels, frames, rows, columns] = match video.shape.as_slice() {
++                [a, b, c, d] => [*a, *b, *c, *d],
++                _ => return Err("the video latent is not four-dimensional".into()),
++            };
++            if init.shape.len() != 4
++                || init.shape[0] != channels
++                || init.shape[2] != rows
++                || init.shape[3] != columns
++            {
++                return Err(format!(
++                    "--init-latent is {:?} but this run is {:?}",
++                    init.shape, video.shape
++                )
++                .into());
++            }
++            let take = hold.min(frames).min(init.shape[1]);
++            let plane = rows * columns;
++            for channel in 0..channels {
++                for index in 0..take {
++                    let source_frame = init.shape[1] - take + index;
++                    let from = (channel * init.shape[1] + source_frame) * plane;
++                    let to = (channel * frames + index) * plane;
++                    video.data[to..to + plane].copy_from_slice(&init.data[from..from + plane]);
++                }
++            }
++            let mut held = vec![0.0f32; channels * take * plane];
++            for channel in 0..channels {
++                for index in 0..take {
++                    let from = (channel * frames + index) * plane;
++                    let to = (channel * take + index) * plane;
++                    held[to..to + plane].copy_from_slice(&video.data[from..from + plane]);
++                }
++            }
++            println!("held the last {take} latent frames of {path} fixed");
++            frozen = Some((Tensor::new(vec![channels, take, rows, columns], held), take));
++        }
++    }
++    // --lock-audio: the target audio latent is the encoded reference sound, held fixed, so the
++    // video denoises against it instead of generating its own soundtrack.
++    let mut audio = match locked_audio {
++        Some(locked) => locked,
++        None => Tensor::new(
++            audio_shape.clone(),
++            noise.samples(audio_shape.iter().product()),
++        ),
++    };
+     let (steps, seed) = (settings.steps, settings.seed);
+     println!(
+         "{}×{}, {} frames ({:.2} s), {} text tokens, {steps} steps, seed {seed}",
+@@ -1015,9 +1131,13 @@ pub fn sample(
+                 }
+                 let (sigma, sigma_next) = (schedule.audio[step], schedule.audio[step + 1]);
+                 if settings.sampler == Sampler::Renoise {
++                    // The draw happens either way so the noise stream stays in step with an
++                    // unlocked run and the video path is identical; a locked run discards it.
+                     let fresh = noise.samples(audio.data.len());
+-                    renoise_step(&mut audio.data, &velocity.audio, &fresh, sigma, sigma_next);
+-                } else {
++                    if !settings.lock_audio {
++                        renoise_step(&mut audio.data, &velocity.audio, &fresh, sigma, sigma_next);
++                    }
++                } else if !settings.lock_audio {
+                     euler_step(&mut audio.data, &velocity.audio, sigma, sigma_next);
+                 }
+             } else if settings.sampler == Sampler::Renoise && step + 1 < steps {
+@@ -1030,13 +1150,15 @@ pub fn sample(
+                     schedule.video[step + 1],
+                 );
+                 let fresh = noise.samples(audio.data.len());
+-                renoise_step(
+-                    &mut audio.data,
+-                    &velocity.audio,
+-                    &fresh,
+-                    schedule.audio[step],
+-                    schedule.audio[step + 1],
+-                );
++                if !settings.lock_audio {
++                    renoise_step(
++                        &mut audio.data,
++                        &velocity.audio,
++                        &fresh,
++                        schedule.audio[step],
++                        schedule.audio[step + 1],
++                    );
++                }
+             } else {
+                 euler_step(
+                     &mut video.data,
+@@ -1044,12 +1166,27 @@ pub fn sample(
+                     schedule.video[step],
+                     schedule.video[step + 1],
+                 );
+-                euler_step(
+-                    &mut audio.data,
+-                    &velocity.audio,
+-                    schedule.audio[step],
+-                    schedule.audio[step + 1],
+-                );
++                if !settings.lock_audio {
++                    euler_step(
++                        &mut audio.data,
++                        &velocity.audio,
++                        schedule.audio[step],
++                        schedule.audio[step + 1],
++                    );
++                }
++            }
++            if let Some((held, take)) = &frozen {
++                if let [channels, frames, rows, columns] = video.shape.as_slice() {
++                    let plane = rows * columns;
++                    for channel in 0..*channels {
++                        for index in 0..*take {
++                            let to = (channel * frames + index) * plane;
++                            let from = (channel * take + index) * plane;
++                            video.data[to..to + plane]
++                                .copy_from_slice(&held.data[from..from + plane]);
++                        }
++                    }
++                }
+             }
+             let routing = routed.map_or(String::new(), |fraction| {
+                 match step_sparse.map(|s| s.method) {
+@@ -1084,6 +1221,14 @@ pub fn sample(
+     }
+     #[cfg(feature = "cuda")]
+     save_algorithm_cache();
++    if let Some(path) = options.get("save-latent") {
++        mmh3_core::safetensors::write_f32(
++            Path::new(path),
++            &[("video", &video.shape, &video.data)],
++            &[],
++        )?;
++        println!("wrote the latent {:?} to {path}", video.shape);
++    }
+     Ok((video, audio))
+ }
+ 
+@@ -1162,6 +1307,45 @@ fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Result<Option<Tensor>,
+     Ok(None)
+ }
+ 
++/// The encoded sound as the target audio latent: the same layout, with the frame count matched
++/// to the canvas by truncation or zero padding, as the reference pipeline does.
++#[cfg(any(feature = "cuda", feature = "metal"))]
++fn lock_audio_latent(encoded: &Tensor, audio_shape: &[usize]) -> Result<Tensor, Box<dyn Error>> {
++    let &[channels, stereo, frames] = encoded.shape.as_slice() else {
++        return Err(format!(
++            "an encoded sound of shape {:?} is not [channels, stereo, frames]",
++            encoded.shape
++        )
++        .into());
++    };
++    let (&want_channels, &want_stereo, &want_frames) = match audio_shape {
++        [a, b, c] => (a, b, c),
++        _ => {
++            return Err(format!(
++                "the audio latent shape {audio_shape:?} is not three-dimensional"
++            )
++            .into())
++        }
++    };
++    if (channels, stereo) != (want_channels, want_stereo) {
++        return Err(format!(
++            "the encoded sound is {channels}x{stereo} but the audio latent is \
++             {want_channels}x{want_stereo}"
++        )
++        .into());
++    }
++    let keep = frames.min(want_frames);
++    let mut data = vec![0.0f32; want_channels * want_stereo * want_frames];
++    for channel in 0..want_channels {
++        for side in 0..want_stereo {
++            let from = (channel * want_stereo + side) * frames;
++            let to = (channel * want_stereo + side) * want_frames;
++            data[to..to + keep].copy_from_slice(&encoded.data[from..from + keep]);
++        }
++    }
++    Ok(Tensor::new(audio_shape.to_vec(), data))
++}
++
+ /// The posterior means of the reference sounds, `[latent channels, stereo channels, frames]` each.
+ /// They take no condition noise, as the reference pipeline leaves reference audio clean.
+ #[cfg(any(feature = "cuda", feature = "metal"))]
+diff --git a/src/image.rs b/src/image.rs
+index c3880d2..b10f0b6 100644
+--- a/src/image.rs
++++ b/src/image.rs
+@@ -263,7 +263,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+     #[cfg(feature = "cuda")]
+     {
+         mmh3_cuda::algorithms::set_consistent(options.contains_key("consistent"));
+-        if options.get("linear-precision").copied() == Some("nvfp4") {
++        if matches!(options.get("linear-precision").copied(), Some("nvfp4" | "nvfp4-slim")) {
+             mmh3_cuda::nvfp4::check_supported()?;
+         }
+         crate::models::load_algorithm_cache();
+@@ -385,12 +385,33 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+                         Held::Alone => crate::metal::attention_precision(&options)?,
+                         Held::Kept(_) => crate::metal::default_attention_precision(),
+                     };
++                    let pre_embeddings = if !references.is_empty() && matches!(held, Held::Alone) {
++                        #[allow(unused_mut)]
++                        let mut vision =
++                            VisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
++                        #[cfg(feature = "metal")]
++                        vision.set_precision(
++                            crate::metal::default_linear_precision(),
++                            vision_precision,
++                        )?;
++                        Some(
++                            references
++                                .iter()
++                                .map(|reference| vision.encode(&reference.vision.to_tensor()))
++                                .collect::<Result<Vec<_>, _>>()?,
++                        )
++                    } else {
++                        None
++                    };
++                    let pre_cell = std::cell::RefCell::new(pre_embeddings);
+                     let (context, modalities) = held.text_encoder(&path, &options, |encoder| {
+                         if references.is_empty() {
+                             return Ok((encoder.encode(&ids, &[])?.context, Vec::new()));
+                         }
+                         // The tower is gone before the prompt encodes.
+-                        let embeddings = {
++                        let embeddings = if let Some(pre) = pre_cell.borrow_mut().take() {
++                            pre
++                        } else {
+                             #[allow(unused_mut)]
+                             let mut vision =
+                                 VisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
+diff --git a/src/models.rs b/src/models.rs
+index 9361209..810911d 100644
+--- a/src/models.rs
++++ b/src/models.rs
+@@ -95,11 +95,15 @@ pub fn load_dit(
+     }
+     match options.get("linear-precision").copied().unwrap_or("int8") {
+         "int8" => {}
+-        "nvfp4" => {
++        mode @ ("nvfp4" | "nvfp4-slim") => {
+             let started = Instant::now();
+-            let layers = dit.use_nvfp4()?;
++            let layers = if mode == "nvfp4-slim" {
++                dit.use_nvfp4_slim()?
++            } else {
++                dit.use_nvfp4()?
++            };
+             println!(
+-                "requantized {layers} layers to NVFP4 in {:.1} s",
++                "requantized {layers} layers to {mode} in {:.1} s",
+                 started.elapsed().as_secs_f64()
+             );
+             if let Some(cache) = algorithm_cache("nvfp4") {
+@@ -113,7 +117,10 @@ pub fn load_dit(
+             }
+         }
+         other => {
+-            return Err(format!("--linear-precision must be int8 or nvfp4, not {other}").into());
++            return Err(
++                format!("--linear-precision must be int8, nvfp4 or nvfp4-slim, not {other}")
++                    .into(),
++            );
+         }
+     }
+     Ok(dit)
