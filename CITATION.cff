@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use this single-Spark GB10 Drama-3 + MMH3 media stack in your work, please cite it as below."
+title: "SAA-Media-Avatar-Panel-Jordan: Single-Spark GB10 Drama-3 + MMH3 Audio-Locked Video Starter"
+abstract: >-
+  A modular, reproducible starter stack pairing a 13.80 GiB 5-language (ZH/EN/JA/KO/YUE)
+  pruned INT3 quantization of Fish Audio Drama 3 running natively on TensorFold (Zig/CUDA)
+  with mmh3 (Rust/CUDA) for MiniMax H3 audio-locked video generation, including a 4-slot
+  LRU VoiceCachePool patch and GB10 unified-memory / async Sol-Attn / nvfp4-slim / CUDA Graph
+  engine patches.
+version: 1.0.0
+date-released: "2026-11-19"
+license: Apache-2.0
+repository-code: "https://github.com/CharAzinabulu0079/SAA-Media-Avatar-Panel-Jordan"
+url: "https://huggingface.co/ThinkingVibeCoder/Drama-3-Tier2-5Lang-INT3"
+authors:
+  - name: "CharAzinabulu0079"
+    website: "https://x.com/EricTong610488"
+references:
+  - type: software
+    title: "TensorFold"
+    authors:
+      - name: "ashhart and TensorFold contributors"
+    repository: "https://github.com/ashhart/TensorFold"
+    license: Apache-2.0
+  - type: software
+    title: "drama-tensorfold"
+    authors:
+      - name: "plotarmordev"
+    repository: "https://github.com/plotarmordev/drama-tensorfold"
+    license: Apache-2.0
+  - type: software
+    title: "mmh3"
+    authors:
+      - name: "Yoshimasa Niwa"
+    repository: "https://github.com/mmh3-org/mmh3"
+    license: MIT
+  - type: model
+    title: "Fish Audio Drama 3"
+    authors:
+      - name: "Fish Audio"
+    url: "https://huggingface.co/fishaudio/drama-3"
+  - type: model
+    title: "MiniMax H3"
+    authors:
+      - name: "MiniMax"
+    url: "https://huggingface.co/MiniMaxAI/MiniMax-H3"
